@@ -52,16 +52,24 @@ Linux：
 
 ```bash
 cd /opt/jiuchong-yaolou-identify
-export SAMEOBJECT_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export TRAINING_WEB_ADMIN_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+cp .env.example .env
+python3 - <<'PY'
+from pathlib import Path
+import secrets
+p = Path('.env')
+text = p.read_text(encoding='utf-8')
+text = text.replace('replace-with-a-long-random-api-key', secrets.token_urlsafe(32))
+text = text.replace('replace-with-a-different-admin-key', secrets.token_urlsafe(32))
+p.write_text(text, encoding='utf-8')
+PY
 ```
 
 Windows PowerShell：
 
 ```powershell
 cd D:\jiuchong-yaolou-identify
-$env:SAMEOBJECT_API_KEY = "your-long-random-key"
-$env:TRAINING_WEB_ADMIN_KEY = "your-different-admin-key"
+Copy-Item .env.example .env
+notepad .env
 ```
 
 两套 Key 分开使用：
@@ -69,7 +77,7 @@ $env:TRAINING_WEB_ADMIN_KEY = "your-different-admin-key"
 - `SAMEOBJECT_API_KEY`：只用于 `POST /api/identify/image` 图片识别接口。
 - `TRAINING_WEB_ADMIN_KEY`：只用于训练 Web 的 `/admin` 与 `/api/admin/*` 管理员接口。
 
-不要把真实 Key 提交到 Git。
+程序会自动读取 `.env`。不要把真实 Key 提交到 Git。
 
 ### 3.2 构建并启动
 

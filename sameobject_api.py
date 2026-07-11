@@ -27,6 +27,28 @@ from predict_sameobject_ensemble import (  # noqa: E402
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
+def load_env_file(path: Path = ROOT_DIR / '.env') -> None:
+    """加载本地 .env，不覆盖系统已设置的环境变量。"""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip().lstrip('\ufeff')
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on', 'y'}
+
+
 class Identifier:
     def __init__(self, full_weights: Path, parts_weights: Path, parts_weight: float) -> None:
         self.full_model, self.full_animals, self.full_mode = load_classifier(full_weights)
@@ -163,6 +185,7 @@ def build_handler(identifier: Identifier, api_key: str, training_web_base=None):
 
 
 def main() -> None:
+    load_env_file()
     parser = argparse.ArgumentParser(description='笑傲江湖-九重妖楼小游戏识别测试 HTTP API')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8090)
@@ -177,7 +200,8 @@ def main() -> None:
     parser.add_argument(
         '--enable-training-web',
         action='store_true',
-        help='把训练数据提交/管理员审核 Web 平台合并挂载到同一个端口。',
+        default=env_flag('ENABLE_TRAINING_WEB', False),
+        help='把训练数据提交/管理员审核 Web 平台合并挂载到同一个端口；也可在 .env 中设置 ENABLE_TRAINING_WEB=1。',
     )
     parser.add_argument(
         '--training-web-admin-key',
@@ -211,11 +235,15 @@ def main() -> None:
             ScreeningWorker,
             StateStore,
             TrainingRunner,
+            auto_promote_matched_items,
             build_handler as build_training_web_handler,
         )
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         store = StateStore(STATE_PATH)
+        promoted = auto_promote_matched_items(store)
+        if promoted:
+            print(f'auto-promoted matched pending items: {promoted}')
         worker = ScreeningWorker(store, args.training_web_reject_confidence, identifier=identifier)
         trainer = TrainingRunner(store)
         training_web_base = build_training_web_handler(store, worker, trainer, args.training_web_admin_key)

@@ -115,17 +115,27 @@ X-API-Key: <your-api-key>
 
 PowerShell：
 
+推荐使用本地 `.env`（不会提交到 Git）。首次部署时：
+
 ```powershell
-$env:SAMEOBJECT_API_KEY = "replace-with-a-long-random-key"
-python sameobject_api.py --host 127.0.0.1 --port 8090
+Copy-Item .env.example .env
+notepad .env
 ```
 
-如需把训练 Web 平台合并到同一个 8090 端口：
+填写：
+
+```text
+SAMEOBJECT_API_KEY=replace-with-a-long-random-api-key
+TRAINING_WEB_ADMIN_KEY=replace-with-a-different-admin-key
+INCLUDE_AUTO_APPROVED_IN_TRAINING=1
+```
+
+`INCLUDE_AUTO_APPROVED_IN_TRAINING` 控制训练时是否默认包含“模型和用户一致后自动通过”的样本；管理员页面训练前也可以临时勾选/取消。
+
+之后直接启动即可，程序会自动读取 `.env`：
 
 ```powershell
-$env:SAMEOBJECT_API_KEY = "replace-with-a-long-random-api-key"
-$env:TRAINING_WEB_ADMIN_KEY = "replace-with-a-different-admin-key"
-python sameobject_api.py --host 127.0.0.1 --port 8090 --enable-training-web
+python sameobject_api.py --host 127.0.0.1 --port 8090
 ```
 
 合并后地址：

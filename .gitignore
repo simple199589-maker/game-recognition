@@ -174,3 +174,4 @@ training_runs/sameobject_animal_classifier/second_full193_parts_v1/*
 # External checkouts / vendored experiments
 vendor/
 yolov5/
+temp/

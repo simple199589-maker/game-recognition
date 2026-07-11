@@ -39,7 +39,30 @@ RUN_ROOT = ROOT_DIR / 'training_runs' / 'sameobject_animal_classifier'
 MAX_IMAGES_PER_BATCH = 10
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_REJECT_CONFIDENCE = 0.80
+DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING = True
 ANIMALS = ['', '野猪', '熊', '豹子', '蜘蛛', '鹿', '羊', '牛', '狼', '袋鼠', '不确定']
+
+
+def load_env_file(path: Path = ROOT_DIR / '.env') -> None:
+    """加载本地 .env，不覆盖系统已设置的环境变量。"""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip().lstrip('\ufeff')
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on', 'y'}
 
 
 def now_iso() -> str:
@@ -172,6 +195,31 @@ class StateStore:
             return counts
 
 
+def auto_promote_matched_items(store: StateStore) -> int:
+    """把历史待审中“用户提交和模型预测完全一致”的样本自动转为待训练。"""
+    changed = 0
+    with store.lock:
+        for item in store.state['items'].values():
+            if item.get('status') != 'needs_admin':
+                continue
+            screen = item.get('screen') or {}
+            pred_pair = sorted([int(x) for x in screen.get('pred_pair') or []])
+            user_pair = sorted([int(x) for x in item.get('pair') or []])
+            pred_animal = str(screen.get('pred_animal') or '').strip()
+            user_animal = str(item.get('animal') or '').strip()
+            if pred_pair and pred_pair == user_pair and pred_animal and pred_animal == user_animal:
+                item['status'] = 'approved'
+                item['review_note'] = item.get('review_note') or 'auto-approved: migrated matched screen result'
+                item['reviewed_at'] = item.get('reviewed_at') or now_iso()
+                item['reviewed_by'] = item.get('reviewed_by') or 'auto_screen_migration'
+                screen['reason'] = '用户答案与模型预测一致，自动通过，进入待训练。'
+                screen['ok'] = True
+                changed += 1
+    if changed:
+        store.save()
+    return changed
+
+
 class ScreeningWorker:
     def __init__(self, store: StateStore, reject_confidence: float, identifier=None) -> None:
         self.store = store
@@ -233,17 +281,28 @@ class ScreeningWorker:
                     result = identifier.identify(image_path.read_bytes())
                     pred_pair = sorted([int(x) for x in result.get('best_pair', [])])
                     score = float(result.get('best_score') or 0.0)
-                    same = pred_pair == user_pair
+                    pred_animal = str(result.get('best_animal') or '').strip()
+                    user_animal = str(item.get('animal') or '').strip()
+                    same_pair = pred_pair == user_pair
+                    same_animal = bool(user_animal) and user_animal == pred_animal
                     screen = {
-                        'ok': same or score < self.reject_confidence,
+                        'ok': (same_pair and same_animal) or ((not same_pair) and score < self.reject_confidence),
                         'mode': 'model',
                         'pred_pair': pred_pair,
-                        'pred_animal': result.get('best_animal', ''),
+                        'pred_animal': pred_animal,
                         'confidence': score,
                         'top_pairs': result.get('top_pairs', []),
                     }
-                    if same:
-                        screen['reason'] = '用户答案与模型预测一致，进入人工审核。'
+                    if same_pair and same_animal:
+                        screen['reason'] = '用户答案与模型预测一致，自动通过，进入待训练。'
+                        status = 'approved'
+                        with self.store.lock:
+                            item = self.store.state['items'][item_id]
+                            item['review_note'] = 'auto-approved: pair/animal matched model prediction'
+                            item['reviewed_at'] = now_iso()
+                            item['reviewed_by'] = 'auto_screen'
+                    elif same_pair:
+                        screen['reason'] = f'答案格一致但动物类别不一致，进入人工审核。用户={user_animal or "空"}，预测={pred_animal or "空"}'
                         status = 'needs_admin'
                     elif score >= self.reject_confidence:
                         screen['reason'] = f'高置信度不一致，疑似乱选，自动拦截。阈值={self.reject_confidence}'
@@ -282,11 +341,18 @@ class TrainingRunner:
         self.store = store
         self.lock = threading.Lock()
 
-    def export_approved_to_manifest(self) -> int:
+    @staticmethod
+    def is_auto_approved(item: dict) -> bool:
+        return str(item.get('reviewed_by') or '').startswith('auto_screen')
+
+    def export_approved_to_manifest(self, include_auto_approved: bool) -> int:
         with self.store.lock:
-            approved = [item for item in self.store.state['items'].values() if item['status'] == 'approved']
+            approved = [
+                item for item in self.store.state['items'].values()
+                if item['status'] == 'approved' and (include_auto_approved or not self.is_auto_approved(item))
+            ]
         if not approved:
-            raise RuntimeError('没有已审核通过的数据。')
+            raise RuntimeError('没有可导出的已通过数据。若只剩自动通过样本，请打开“包含自动通过样本”。')
 
         ANSWER_PATH.parent.mkdir(parents=True, exist_ok=True)
         manifest = load_json(ANSWER_PATH, {'_说明': 'pair 是正确两个格子；animals 是 1-8 每格动物类别。', 'answers': []})
@@ -326,7 +392,7 @@ class TrainingRunner:
         atomic_write_json(ANSWER_PATH, merged)
         return exported
 
-    def start(self, run_name: str, feature_mode: str, epochs: int, val_ratio: float) -> dict:
+    def start(self, run_name: str, feature_mode: str, epochs: int, val_ratio: float, include_auto_approved: bool) -> dict:
         with self.lock:
             with self.store.lock:
                 for job in self.store.state['train_jobs'].values():
@@ -335,7 +401,7 @@ class TrainingRunner:
                 blocking = [item for item in self.store.state['items'].values() if item['status'] in {'screening', 'needs_admin'}]
                 if blocking:
                     raise RuntimeError(f'还有 {len(blocking)} 条数据未完成审核，不能开始训练。')
-            exported = self.export_approved_to_manifest()
+            exported = self.export_approved_to_manifest(include_auto_approved)
             job_id = uuid.uuid4().hex[:12]
             log_path = TRAIN_LOG_DIR / f'{job_id}.log'
             TRAIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -366,6 +432,7 @@ class TrainingRunner:
                 'feature_mode': feature_mode,
                 'epochs': epochs,
                 'val_ratio': val_ratio,
+                'include_auto_approved': include_auto_approved,
                 'exported_count': exported,
                 'log_path': posix_rel(log_path),
                 'pid': process.pid,
@@ -396,219 +463,54 @@ USER_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>九重妖楼识别测试数据提交</title>
+  <title>SameObject 训练标注</title>
   <style>
-    :root{color-scheme:dark;--bg:#0b1020;--panel:#111827;--panel2:#0f172a;--line:#334155;--text:#e5e7eb;--muted:#94a3b8;--blue:#2563eb;--green:#16a34a;--red:#dc2626;--yellow:#d97706}
-    *{box-sizing:border-box} body{margin:0;background:linear-gradient(135deg,#08111f,#111827 46%,#0b1020);color:var(--text);font:16px/1.55 system-ui,"Segoe UI",Arial}
-    header{position:sticky;top:0;z-index:20;background:rgba(15,23,42,.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
-    .bar{max-width:1280px;margin:auto;padding:14px 18px;display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap}
-    a{color:#93c5fd}.brand{font-weight:800;font-size:18px}.muted{color:var(--muted)} main{max-width:1280px;margin:auto;padding:20px;display:grid;gap:18px}
-    .card{background:rgba(17,24,39,.88);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 20px 50px rgba(0,0,0,.25)}
-    .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.step{padding:14px;border:1px solid var(--line);border-radius:14px;background:var(--panel2)}.step b{display:block}
-    button,input,select{font:inherit;border:1px solid var(--line);border-radius:10px;background:#1f2937;color:var(--text);padding:10px 12px;min-height:44px}
-    button{cursor:pointer;transition:.18s ease;background:#243044}button:hover{border-color:#60a5fa;background:#1e3a5f}button:focus,input:focus,select:focus{outline:3px solid rgba(96,165,250,.35)}
-    button.primary{background:var(--blue);border-color:#60a5fa}button.success{background:var(--green);border-color:#4ade80}button.danger{background:var(--red);border-color:#f87171}button:disabled{opacity:.55;cursor:not-allowed}
-    .upload{border:2px dashed #475569;border-radius:18px;padding:22px;text-align:center;background:rgba(15,23,42,.7)}.upload input{width:min(620px,100%)}
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}.item{border:1px solid var(--line);border-radius:16px;padding:12px;background:var(--panel2)}
-    .imageWrap{position:relative;display:inline-block;width:100%;background:#020617;border-radius:12px;overflow:hidden}.imageWrap img{display:block;width:100%;height:auto;user-select:none}
-    .box{position:absolute;border:3px solid #38bdf8;border-radius:10px;background:rgba(56,189,248,.08);cursor:pointer;min-width:32px;min-height:32px}
-    .box.selected{border-color:#ef4444;background:rgba(239,68,68,.24);box-shadow:0 0 0 2px rgba(239,68,68,.22),0 0 18px rgba(239,68,68,.5)}
-    .num{position:absolute;left:3px;top:2px;background:rgba(2,6,23,.82);padding:0 6px;border-radius:6px;font-weight:800}.tag{position:absolute;right:3px;bottom:2px;background:rgba(37,99,235,.9);padding:0 6px;border-radius:6px;font-size:13px}
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}.animalBtns{display:flex;gap:8px;flex-wrap:wrap}.animalBtns button{padding:7px 10px;min-height:38px}.animalBtns button.active{background:#1d4ed8;border-color:#93c5fd}
-    .status{padding:12px;border-radius:12px;background:#0f172a;border:1px solid var(--line);white-space:pre-wrap}.ok{color:#86efac}.bad{color:#fca5a5}.warn{color:#fcd34d}
-    @media(max-width:820px){.steps{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.bar{align-items:flex-start}}
+    :root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--line:#30363d;--text:#e6edf3;--muted:#8b949e;--blue:#1f6feb;--green:#238636}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",Arial,sans-serif;overflow:hidden}
+    header{height:56px;background:#161b22;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;padding:8px 12px;white-space:nowrap}.brand{font-weight:800;font-size:16px}.meta{color:var(--muted)}a{color:#58a6ff}
+    button,input{background:#21262d;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:7px 9px;font:inherit;min-height:34px}button{cursor:pointer}button:not(.box):hover{background:#30363d}button:focus,input:focus{outline:2px solid rgba(88,166,255,.45)}button.primary{background:var(--blue);border-color:#58a6ff}button.success{background:var(--green);border-color:#2ea043}button:disabled{opacity:.55;cursor:not-allowed}
+    main{height:calc(100vh - 56px);display:grid;grid-template-columns:minmax(620px,1fr) 360px;gap:10px;padding:10px;overflow:hidden}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;min-height:0}.stage{display:flex;flex-direction:column;overflow:hidden}.topline{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line)}
+    .viewer{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:auto;background:#05080c;border-radius:0 0 10px 10px}.imageWrap{position:relative;display:inline-block;max-width:100%;max-height:100%}#captcha{display:block;max-width:100%;max-height:calc(100vh - 128px);height:auto;width:auto;user-select:none}
+    .box{position:absolute;border:3px solid #2ea043;border-radius:10px;background:rgba(46,160,67,.06);cursor:pointer;min-width:28px;min-height:28px}.box:hover{background:rgba(46,160,67,.12);border-color:#56d364}.box.selected{border-color:#ff4d4f;background:rgba(255,77,79,.2);box-shadow:0 0 14px rgba(255,77,79,.7)}.box.selected:hover{background:rgba(255,77,79,.24);border-color:#ff7b72}.box .num{position:absolute;left:3px;top:2px;background:rgba(0,0,0,.72);border-radius:5px;padding:0 5px;font-weight:800}.box .tag{position:absolute;right:3px;bottom:2px;background:rgba(31,111,235,.9);border-radius:5px;padding:0 5px;font-size:12px}
+    aside{padding:10px;overflow:auto}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}.pair{font-weight:800}.ok{color:#3fb950}.bad{color:#ff7b72}.yellow{color:#f2cc60}.animalGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.animalGrid button.active{background:var(--blue);border-color:#58a6ff}.thumbs{display:flex;gap:6px;overflow:auto;padding:7px 0}.thumb{border:2px solid var(--line);border-radius:8px;background:#0d1117;padding:2px;cursor:pointer;position:relative}.thumb.active{border-color:#58a6ff}.thumb.done:after{content:"";position:absolute;right:3px;top:3px;width:9px;height:9px;border-radius:50%;background:#3fb950}.thumb img{display:block;width:58px;height:36px;object-fit:cover;border-radius:5px}.hint{font-size:13px;color:#c9d1d9;line-height:1.65}.kbd{background:#30363d;border-radius:4px;padding:1px 5px;font-family:Consolas,monospace}.status{white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:8px;min-height:70px;color:var(--muted)}
+    @media(max-width:980px){body{overflow:auto}main{height:auto;grid-template-columns:1fr}.viewer{min-height:420px}#captcha{max-height:70vh}}
   </style>
 </head>
 <body>
-<header><div class="bar"><div><div class="brand">九重妖楼识别测试数据提交</div><div class="muted">每轮最多上传 10 张，全部勾选后提交，服务器后台初筛。</div></div><a href="/admin">管理员审核区</a></div></header>
-<main>
-  <section class="steps">
-    <div class="step"><b>1. 上传图片</b><span class="muted">支持 PNG/JPG/WebP，每轮最多 10 张。</span></div>
-    <div class="step"><b>2. 勾选答案</b><span class="muted">每张图片选择两个正确格子，并填写动物类别。</span></div>
-    <div class="step"><b>3. 提交初筛</b><span class="muted">疑似乱选会被拦截，正常数据进入人工审核。</span></div>
-  </section>
-  <section class="card upload">
-    <h2>上传一轮图片</h2>
-    <p class="muted">选择 1-10 张图片。上传后在下方逐张勾选两个答案格。</p>
-    <input id="fileInput" type="file" accept="image/*" multiple>
-    <div class="row" style="justify-content:center"><button id="uploadBtn" class="primary">上传并开始勾选</button><button id="resetBtn">清空当前轮</button></div>
-  </section>
-  <section class="card">
-    <div class="row" style="justify-content:space-between">
-      <h2 style="margin:0">当前轮标注</h2>
-      <div class="muted" id="batchMeta">尚未上传</div>
-    </div>
-    <div id="items" class="grid"></div>
-    <div class="row"><button id="submitBtn" class="success" disabled>全部勾选完成，提交到服务器</button><button id="refreshBtn" disabled>刷新初筛状态</button></div>
-    <div id="status" class="status muted">等待上传。</div>
-  </section>
-</main>
+<header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
+<main><section class="panel stage"><div class="topline"><div><b id="title">等待上传</b> <span id="fileMeta" class="meta"></span></div><div class="pair" id="pairText">未选择</div></div><div class="viewer"><div id="imageWrap" class="imageWrap"><img id="captcha" alt="当前标注图片"></div></div></section><aside class="panel"><div class="row"><b>动物类别</b><span id="animalText" class="yellow">未选择</span></div><div id="animalGrid" class="animalGrid"></div><div class="row"><input id="animalOther" placeholder="自定义类别" style="flex:1;min-width:0"><button id="applyOtherBtn">应用</button></div><div class="row"><button id="clearPairBtn">清空当前</button><button id="refreshBtn" disabled>刷新初筛</button></div><div class="thumbs" id="thumbs"></div><div class="hint"><p><b>快捷键</b>：<span class="kbd">1-8</span> 选答案格，<span class="kbd">A/←</span> 上一张，<span class="kbd">D/→</span> 下一张，<span class="kbd">Enter</span> 下一张，<span class="kbd">Ctrl+Enter</span> 提交整轮。</p><p>每轮最多 10 张；所有图片都选好两个格子并填写类别后才可提交。</p></div><div id="status" class="status">请选择图片上传。</div></aside></main>
 <script>
-const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定'];
-let batch = null;
-const answers = new Map();
-const $ = id => document.getElementById(id);
-function setStatus(text, cls='muted'){ $('status').className = 'status ' + cls; $('status').textContent = text; }
-function esc(s){ return String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
-async function api(url, opts={}){ const r = await fetch(url, opts); const data = await r.json().catch(()=>({})); if(!r.ok || data.code){ throw new Error(data.message || r.statusText); } return data.data ?? data; }
-function ensureAnswer(id){ if(!answers.has(id)) answers.set(id, {pair:[], animal:''}); return answers.get(id); }
-function renderItems(){
-  const root = $('items'); root.innerHTML = '';
-  if(!batch){ $('batchMeta').textContent='尚未上传'; $('submitBtn').disabled=true; return; }
-  $('batchMeta').textContent = `批次 ${batch.batch_id}，${batch.items.length} 张`;
-  for(const item of batch.items){
-    const ans = ensureAnswer(item.id);
-    const div = document.createElement('div'); div.className='item'; div.dataset.id=item.id;
-    div.innerHTML = `<b>${esc(item.filename)}</b><div class="muted">选择两个答案格：<span class="pairText"></span></div>
-      <div class="imageWrap"><img alt="待标注图片 ${esc(item.filename)}" src="${item.image_url}"></div>
-      <div class="row"><label>动物类别 <select class="animalSelect">${animals.map(a=>`<option value="${esc(a)}">${a?esc(a):'请选择'}</option>`).join('')}</select></label></div>
-      <div class="animalBtns">${animals.filter(Boolean).map(a=>`<button type="button" data-animal="${esc(a)}">${esc(a)}</button>`).join('')}</div>`;
-    const img = div.querySelector('img');
-    img.addEventListener('load', ()=>drawBoxes(div, item));
-    div.querySelector('.animalSelect').value = ans.animal;
-    div.querySelector('.animalSelect').addEventListener('change', e=>{ ans.animal=e.target.value; updateCard(div,item); updateSubmitState(); });
-    div.querySelectorAll('[data-animal]').forEach(btn=>btn.addEventListener('click',()=>{ ans.animal=btn.dataset.animal; updateCard(div,item); updateSubmitState(); }));
-    root.appendChild(div);
-  }
-  updateSubmitState();
-}
-function drawBoxes(card, item){
-  const wrap = card.querySelector('.imageWrap'); wrap.querySelectorAll('.box').forEach(x=>x.remove());
-  const img = wrap.querySelector('img'); const sx = img.clientWidth / item.size[0], sy = img.clientHeight / item.size[1];
-  for(let i=0;i<item.boxes.length;i++){
-    const n=i+1, b=item.boxes[i], box=document.createElement('button'); box.type='button'; box.className='box'; box.style.left=(b[0]*sx)+'px'; box.style.top=(b[1]*sy)+'px'; box.style.width=(b[2]*sx)+'px'; box.style.height=(b[3]*sy)+'px'; box.setAttribute('aria-label', `选择第 ${n} 格`); box.innerHTML=`<span class="num">${n}</span>`;
-    box.addEventListener('click',()=>toggle(item.id,n,card,item)); wrap.appendChild(box);
-  }
-  updateCard(card,item);
-}
-function toggle(id,n,card,item){ const ans=ensureAnswer(id); if(ans.pair.includes(n)) ans.pair=ans.pair.filter(x=>x!==n); else { if(ans.pair.length>=2) ans.pair.shift(); ans.pair.push(n); ans.pair.sort((a,b)=>a-b); } updateCard(card,item); updateSubmitState(); }
-function updateCard(card,item){
-  const ans=ensureAnswer(item.id);
-  card.querySelector('.pairText').textContent = ans.pair.length ? `[${ans.pair.join(', ')}]${ans.pair.length<2?'，还差 '+(2-ans.pair.length)+' 个':''}` : '未选择';
-  card.querySelector('.animalSelect').value = ans.animal;
-  card.querySelectorAll('.box').forEach((box,i)=>box.classList.toggle('selected', ans.pair.includes(i+1)));
-  card.querySelectorAll('[data-animal]').forEach(btn=>btn.classList.toggle('active', btn.dataset.animal===ans.animal));
-}
-function complete(){ return batch && batch.items.every(it => { const a=answers.get(it.id); return a && a.pair.length===2 && a.animal; }); }
-function updateSubmitState(){ $('submitBtn').disabled = !complete(); }
-$('uploadBtn').onclick = async () => {
-  const files = [...$('fileInput').files];
-  if(files.length<1 || files.length>10){ setStatus('请选择 1-10 张图片。','bad'); return; }
-  const fd = new FormData(); files.forEach(f=>fd.append('images', f));
-  $('uploadBtn').disabled = true; setStatus('正在上传并自动切格...');
-  try{ const data = await api('/api/uploads', {method:'POST', body:fd}); batch=data; answers.clear(); renderItems(); $('refreshBtn').disabled=false; setStatus('上传完成。请逐张选择两个答案格，并填写动物类别。','ok'); }
-  catch(e){ setStatus(e.message,'bad'); }
-  finally{ $('uploadBtn').disabled = false; }
-};
-$('resetBtn').onclick = ()=>{ batch=null; answers.clear(); renderItems(); setStatus('已清空当前轮。'); $('refreshBtn').disabled=true; };
-$('submitBtn').onclick = async () => {
-  if(!complete()) return;
-  const payload = {answers: batch.items.map(it => ({item_id:it.id, pair:answers.get(it.id).pair, animal:answers.get(it.id).animal}))};
-  $('submitBtn').disabled = true; setStatus('已提交，后台正在初筛...');
-  try{ await api(`/api/submissions/${batch.batch_id}/submit`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); setStatus('提交成功。后台初筛中，可点击刷新查看结果。','ok'); }
-  catch(e){ setStatus(e.message,'bad'); updateSubmitState(); }
-};
-$('refreshBtn').onclick = async () => {
-  if(!batch) return;
-  try{ const data = await api(`/api/submissions/${batch.batch_id}`); const lines = data.items.map(it => `${it.filename}: ${it.status}${it.screen?.reason ? ' - '+it.screen.reason : ''}`); setStatus(`批次状态：${data.status}\n` + lines.join('\n'), 'warn'); }
-  catch(e){ setStatus(e.message,'bad'); }
-};
-window.addEventListener('resize', renderItems);
-</script>
-</body>
-</html>
+const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
+function setStatus(t,cls=''){ $('status').className='status '+cls; $('status').textContent=t; } function esc(s){ return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); } async function api(url,opts={}){ const r=await fetch(url,opts); const d=await r.json().catch(()=>({})); if(!r.ok||d.code) throw new Error(d.message||r.statusText); return d.data??d; }
+function current(){ return batch?.items[idx]; } function ans(id){ if(!answers.has(id)) answers.set(id,{pair:[],animal:''}); return answers.get(id); } function completeItem(it){ const a=answers.get(it.id); return a&&a.pair.length===2&&a.animal; } function complete(){ return batch&&batch.items.every(completeItem); }
+function renderAnimals(){ const grid=$('animalGrid'); grid.innerHTML=''; const a=current()?ans(current().id):{animal:''}; for(const animal of animals.filter(Boolean)){ const b=document.createElement('button'); b.textContent=animal; b.className=a.animal===animal?'active':''; b.onclick=()=>{ if(!current())return; ans(current().id).animal=animal; render(); }; grid.appendChild(b); } }
+function renderThumbs(){ const root=$('thumbs'); root.innerHTML=''; if(!batch)return; batch.items.forEach((it,i)=>{ const d=document.createElement('button'); d.className='thumb '+(i===idx?'active ':'')+(completeItem(it)?'done':''); d.title=it.filename; d.innerHTML=`<img alt="${esc(it.filename)}" src="${it.image_url}">`; d.onclick=()=>{idx=i;render();}; root.appendChild(d); }); }
+function render(){ const it=current(); $('submitBtn').disabled=!complete(); $('refreshBtn').disabled=!batch; renderAnimals(); renderThumbs(); if(!it){ $('title').textContent='等待上传'; $('fileMeta').textContent=''; $('captcha').removeAttribute('src'); $('pairText').textContent='未选择'; $('animalText').textContent='未选择'; $('progress').textContent='未上传'; clearBoxes(); return; } const a=ans(it.id); $('title').textContent=`#${idx+1}/${batch.items.length} ${it.filename}`; $('fileMeta').textContent=`${it.size[0]}×${it.size[1]} · ${it.box_source}`; $('pairText').textContent=a.pair.length===2?`答案 [${a.pair.join(', ')}]`:a.pair.length?`[${a.pair.join(', ')}] 还差 ${2-a.pair.length} 个`:'未选择'; $('pairText').className='pair '+(a.pair.length===2?'ok':'bad'); $('animalText').textContent=a.animal||'未选择'; $('animalText').className=a.animal?'ok':'yellow'; $('progress').textContent=`${idx+1}/${batch.items.length}，完成 ${batch.items.filter(completeItem).length}/${batch.items.length}`; const img=$('captcha'); img.onload=drawBoxes; if(img.getAttribute('src')!==it.image_url) img.src=it.image_url; else drawBoxes(); }
+function clearBoxes(){ document.querySelectorAll('.box').forEach(x=>x.remove()); } function drawBoxes(){ clearBoxes(); const it=current(); if(!it)return; const img=$('captcha'), wrap=$('imageWrap'), a=ans(it.id); const sx=img.clientWidth/it.size[0], sy=img.clientHeight/it.size[1]; it.boxes.forEach((b,i)=>{ const n=i+1, div=document.createElement('button'); div.type='button'; div.className='box '+(a.pair.includes(n)?'selected':''); div.style.left=(b[0]*sx)+'px'; div.style.top=(b[1]*sy)+'px'; div.style.width=(b[2]*sx)+'px'; div.style.height=(b[3]*sy)+'px'; div.innerHTML=`<span class="num">${n}</span>${a.pair.includes(n)&&a.animal?`<span class="tag">${esc(a.animal)}</span>`:''}`; div.onclick=()=>toggle(n); wrap.appendChild(div); }); }
+function toggle(n){ const it=current(); if(!it)return; const a=ans(it.id); if(a.pair.includes(n)) a.pair=a.pair.filter(x=>x!==n); else { if(a.pair.length>=2)a.pair.shift(); a.pair.push(n); a.pair.sort((x,y)=>x-y); } render(); } function move(d){ if(!batch)return; idx=(idx+d+batch.items.length)%batch.items.length; render(); }
+$('uploadBtn').onclick=async()=>{ const files=[...$('fileInput').files]; if(files.length<1||files.length>10){setStatus('请选择 1-10 张图片。','bad');return;} const fd=new FormData(); files.forEach(f=>fd.append('images',f)); $('uploadBtn').disabled=true; setStatus('上传并切格中...'); try{ batch=await api('/api/uploads',{method:'POST',body:fd}); idx=0; answers.clear(); render(); setStatus('上传完成，按 1-8 勾选答案。','ok'); }catch(e){setStatus(e.message,'bad');}finally{$('uploadBtn').disabled=false;} };
+$('prevBtn').onclick=()=>move(-1); $('nextBtn').onclick=()=>move(1); $('clearPairBtn').onclick=()=>{ const it=current(); if(!it)return; answers.set(it.id,{pair:[],animal:ans(it.id).animal}); render(); }; $('applyOtherBtn').onclick=()=>{ const it=current(), v=$('animalOther').value.trim(); if(it&&v){ ans(it.id).animal=v; render(); }};
+$('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('已提交，后台初筛中...'); try{ await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); setStatus('提交成功。可以稍后刷新初筛结果。','ok'); }catch(e){setStatus(e.message,'bad'); render();} };
+$('refreshBtn').onclick=async()=>{ if(!batch)return; try{ const d=await api(`/api/submissions/${batch.batch_id}`); setStatus('批次状态：'+d.status+'\n'+d.items.map(x=>`${x.filename}: ${x.status}${x.screen?.reason?' - '+x.screen.reason:''}`).join('\n'),'yellow'); }catch(e){setStatus(e.message,'bad');} };
+window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render();
+</script></body></html>
 """
 
-
 ADMIN_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>九重妖楼识别测试管理员审核</title>
-  <style>
-    :root{color-scheme:dark;--bg:#020617;--panel:#111827;--line:#334155;--text:#e5e7eb;--muted:#94a3b8;--blue:#2563eb;--green:#16a34a;--red:#dc2626;--yellow:#d97706}
-    *{box-sizing:border-box} body{margin:0;background:#020617;color:var(--text);font:16px/1.55 system-ui,"Segoe UI",Arial} header{position:sticky;top:0;z-index:30;background:rgba(15,23,42,.94);border-bottom:1px solid var(--line);backdrop-filter:blur(12px)}
-    .bar,main{max-width:1440px;margin:auto}.bar{padding:14px 18px;display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap}main{padding:18px;display:grid;gap:16px}
-    a{color:#93c5fd}.brand{font-weight:800}.muted{color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:10px}.stat,.panel,.item{background:#111827;border:1px solid var(--line);border-radius:16px;padding:14px}.stat b{font-size:26px;display:block}
-    button,input,select{font:inherit;border:1px solid var(--line);border-radius:10px;background:#1f2937;color:var(--text);padding:9px 12px;min-height:42px}button{cursor:pointer}button:hover{border-color:#60a5fa}.primary{background:var(--blue)}.success{background:var(--green)}.danger{background:var(--red)}.warnBtn{background:var(--yellow)}button:focus,input:focus,select:focus{outline:3px solid rgba(96,165,250,.35)}
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.list{display:grid;grid-template-columns:repeat(auto-fill,minmax(430px,1fr));gap:14px}.item img{width:100%;border-radius:12px;background:#020617}.badge{display:inline-block;padding:3px 8px;border-radius:999px;background:#334155;color:#e2e8f0}.badge.needs_admin{background:#854d0e}.badge.approved{background:#166534}.badge.rejected,.badge.auto_rejected{background:#991b1b}.badge.screening{background:#1d4ed8}
-    textarea{width:100%;min-height:82px;background:#0f172a;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:10px}.status{white-space:pre-wrap;background:#0f172a;border:1px solid var(--line);border-radius:12px;padding:12px}.small{font-size:13px}.ok{color:#86efac}.bad{color:#fca5a5}.warn{color:#fde68a}
-    @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.list{grid-template-columns:1fr}}
-  </style>
-</head>
-<body>
-<header><div class="bar"><div><div class="brand">九重妖楼识别测试管理员审核区</div><div class="muted">审核通过的数据会在开始训练前合并到 manual_answers.json。</div></div><div class="row"><a href="/">用户提交页</a><button id="refreshBtn">刷新</button></div></div></header>
-<main>
-  <section class="cards" id="stats"></section>
-  <section class="panel">
-    <div class="row">
-      <label>状态 <select id="statusFilter"><option value="needs_admin">待审核</option><option value="auto_rejected">自动拦截</option><option value="approved">已通过</option><option value="rejected">已拒绝</option><option value="screening">初筛中</option><option value="all">全部</option></select></label>
-      <label>Admin Key <input id="adminKey" type="password" placeholder="如果服务端配置了 TRAINING_WEB_ADMIN_KEY"></label>
-      <button id="loadBtn" class="primary">加载列表</button>
-    </div>
-  </section>
-  <section class="panel">
-    <h2>训练控制</h2>
-    <div class="row">
-      <label>run-name <input id="runName" value="web_review_parts_v1"></label>
-      <label>feature-mode <select id="featureMode"><option value="parts_v1">parts_v1</option><option value="processed_v2">processed_v2</option></select></label>
-      <label>epochs <input id="epochs" type="number" min="1" value="180" style="width:110px"></label>
-      <label>val-ratio <input id="valRatio" type="number" min="0.05" max="0.9" step="0.05" value="0.2" style="width:110px"></label>
-      <button id="trainBtn" class="success">全部审核后开始训练</button>
-      <button id="trainStatusBtn">训练状态</button>
-    </div>
-    <div id="trainStatus" class="status muted">尚未查询。</div>
-  </section>
-  <section class="list" id="list"></section>
-</main>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SameObject 管理员审核</title><style>
+:root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--line:#30363d;--text:#e6edf3;--muted:#8b949e;--blue:#1f6feb;--green:#238636}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",Arial,sans-serif}a{color:#58a6ff}.muted{color:var(--muted)}button,input,select,textarea{background:#21262d;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:7px 9px;font:inherit;min-height:34px}button{cursor:pointer}button:hover{background:#30363d}.primary{background:var(--blue)}.success{background:var(--green)}.danger{background:#8e1519}.warnBtn{background:#9e6a03}.ok{color:#3fb950}.bad{color:#ff7b72}.yellow{color:#f2cc60}
+#loginView{min-height:100vh;display:grid;place-items:center;padding:18px}.login{width:min(420px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.35)}.login h1{margin:0 0 10px;font-size:20px}.login input{width:100%;margin:10px 0}.login button{width:100%}#appView{display:none}header{position:sticky;top:0;z-index:20;background:#161b22;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;padding:8px 12px}.brand{font-weight:800;font-size:16px}.spacer{flex:1}.topSwitch{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid var(--line);border-radius:999px;background:#0d1117;color:#c9d1d9;white-space:nowrap}.topSwitch input{min-height:auto;width:16px;height:16px;accent-color:#238636}main{padding:10px;display:grid;gap:10px}.stats{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:8px}.stat,.panel,.item{background:var(--panel);border:1px solid var(--line);border-radius:10px}.stat{padding:9px 11px}.stat b{display:block;font-size:22px}.panel{padding:10px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.list{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}.item{padding:9px}.item img{width:100%;height:178px;object-fit:contain;background:#05080c;border-radius:8px;cursor:zoom-in}.badge{display:inline-block;padding:2px 7px;border-radius:999px;background:#334155}.badge.needs_admin{background:#854d0e}.badge.approved{background:#166534}.badge.rejected,.badge.auto_rejected{background:#991b1b}.badge.screening{background:#1d4ed8}.small{font-size:12px}.item input{width:92px}.item textarea{width:100%;min-height:54px;margin-top:6px;background:#0d1117}.status{white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:8px;color:var(--muted);max-height:220px;overflow:auto}#zoom{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.86);display:none;align-items:center;justify-content:center;padding:22px}#zoom img{max-width:96vw;max-height:92vh;border-radius:10px;background:#05080c}#zoom button{position:fixed;right:18px;top:14px}@media(max-width:800px){.stats{grid-template-columns:repeat(2,1fr)}.list{grid-template-columns:1fr}header{flex-wrap:wrap}}
+</style></head><body>
+<section id="loginView"><div class="login"><h1>管理员登录</h1><p class="muted">请输入训练 Web 管理员 Key。成功后只保存在当前浏览器会话中。</p><input id="loginKey" type="password" placeholder="TRAINING_WEB_ADMIN_KEY" autofocus><button id="loginBtn" class="primary">进入审核区</button><p id="loginMsg" class="bad"></p><p><a href="/">返回用户提交页</a></p></div></section>
+<section id="appView"><header><span class="brand">管理员审核</span><button id="refreshBtn">刷新</button><label>状态 <select id="statusFilter"><option value="needs_admin">待审核</option><option value="auto_rejected">自动拦截</option><option value="approved">待训练/已通过</option><option value="rejected">已拒绝</option><option value="screening">初筛中</option><option value="all">全部</option></select></label><label class="topSwitch" title="训练时是否包含模型和用户一致后自动通过的样本"><input id="includeAutoApproved" type="checkbox" checked> 训练包含自动通过</label><span class="spacer"></span><button id="logoutBtn">退出</button><a href="/">用户页</a></header><main><section class="stats" id="stats"></section><section class="panel"><div class="row"><label>run-name <input id="runName" value="web_review_parts_v1" style="width:170px"></label><label>feature <select id="featureMode"><option value="parts_v1">parts_v1</option><option value="processed_v2">processed_v2</option></select></label><label>epochs <input id="epochs" type="number" min="1" value="180" style="width:90px"></label><label>val <input id="valRatio" type="number" min="0.05" max="0.9" step="0.05" value="0.2" style="width:80px"></label><button id="trainBtn" class="success">全部审核后训练</button><button id="trainStatusBtn">训练状态</button></div><div id="trainStatus" class="status">尚未查询。</div></section><section class="list" id="list"></section></main></section><div id="zoom"><button id="zoomClose">关闭 Esc</button><img id="zoomImg" alt="放大预览"></div>
 <script>
-const $ = id => document.getElementById(id);
-function esc(s){ return String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
-function headers(){ const h={'Content-Type':'application/json'}; const k=$('adminKey').value.trim(); if(k) h['X-Admin-Key']=k; return h; }
-async function api(url, opts={}){ opts.headers={...(opts.headers||{}), ...headers()}; const r=await fetch(url,opts); const data=await r.json().catch(()=>({})); if(!r.ok || data.code){ throw new Error(data.message || r.statusText); } return data.data ?? data; }
-function badge(s){ return `<span class="badge ${esc(s)}">${esc(s)}</span>`; }
-async function loadStats(){ const data=await api('/api/admin/stats'); const keys=['needs_admin','screening','auto_rejected','approved','rejected']; $('stats').innerHTML=keys.map(k=>`<div class="stat"><span class="muted">${k}</span><b>${data.counts[k]||0}</b></div>`).join(''); }
-async function loadList(){
-  await loadStats();
-  const st=$('statusFilter').value; const data=await api('/api/admin/items?status='+encodeURIComponent(st));
-  $('list').innerHTML = data.items.map(renderItem).join('');
-  document.querySelectorAll('[data-action]').forEach(btn=>btn.addEventListener('click',()=>review(btn.dataset.id, btn.dataset.action)));
-}
-function renderItem(it){
-  const screen = it.screen || {};
-  const pair = (it.pair||[]).join(',');
-  const animals = it.animals ? JSON.stringify(it.animals) : '';
-  return `<article class="item" id="item-${esc(it.id)}">
-    <div class="row" style="justify-content:space-between"><b>${esc(it.filename)}</b>${badge(it.status)}</div>
-    <img src="${it.image_url}" alt="审核图片 ${esc(it.filename)}" loading="lazy">
-    <div class="small muted">提交答案：pair=[${esc(pair)}] animal=${esc(it.animal||'')}</div>
-    <div class="small ${screen.ok===false?'bad':'warn'}">初筛：${esc(screen.reason||'无')} ${screen.pred_pair?`预测=[${esc(screen.pred_pair.join(','))}] ${esc(screen.pred_animal||'')} score=${esc(screen.confidence)}`:''}</div>
-    <div class="row"><label>pair <input id="pair-${esc(it.id)}" value="${esc(pair)}" style="width:100px"></label><label>animal <input id="animal-${esc(it.id)}" value="${esc(it.animal||'')}" style="width:120px"></label></div>
-    <textarea id="note-${esc(it.id)}" placeholder="审核备注">${esc(it.review_note||'')}</textarea>
-    <div class="row"><button class="success" data-action="approve" data-id="${esc(it.id)}">审核通过</button><button class="danger" data-action="reject" data-id="${esc(it.id)}">拒绝</button><button class="warnBtn" data-action="needs_admin" data-id="${esc(it.id)}">退回待审</button></div>
-  </article>`;
-}
-async function review(id, decision){
-  const pairText = document.getElementById('pair-'+id).value;
-  const pair = pairText.split(',').map(x=>Number(x.trim())).filter(Boolean);
-  const animal = document.getElementById('animal-'+id).value.trim();
-  const note = document.getElementById('note-'+id).value.trim();
-  try{ await api('/api/admin/items/'+id+'/review',{method:'POST',body:JSON.stringify({decision,pair,animal,note})}); await loadList(); }
-  catch(e){ alert(e.message); }
-}
-$('loadBtn').onclick=loadList; $('refreshBtn').onclick=loadList; $('statusFilter').onchange=loadList;
-$('trainBtn').onclick=async()=>{
-  const payload={run_name:$('runName').value.trim(), feature_mode:$('featureMode').value, epochs:Number($('epochs').value), val_ratio:Number($('valRatio').value)};
-  $('trainStatus').textContent='正在启动训练...';
-  try{ const data=await api('/api/admin/train',{method:'POST',body:JSON.stringify(payload)}); $('trainStatus').textContent='训练已启动：'+JSON.stringify(data,null,2); await loadStats(); }
-  catch(e){ $('trainStatus').textContent=e.message; $('trainStatus').className='status bad'; }
-};
-$('trainStatusBtn').onclick=async()=>{ try{ const data=await api('/api/admin/train-status'); $('trainStatus').className='status'; $('trainStatus').textContent=JSON.stringify(data,null,2); }catch(e){ $('trainStatus').textContent=e.message; } };
-loadList().catch(e=>{$('list').innerHTML='<div class="status bad">'+esc(e.message)+'</div>';});
-</script>
-</body>
-</html>
+const KEY='sameobject_admin_key'; const $=id=>document.getElementById(id); let adminKey=sessionStorage.getItem(KEY)||''; function esc(s){return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));} function headers(){return {'Content-Type':'application/json','X-Admin-Key':adminKey};} async function api(url,opts={}){opts.headers={...(opts.headers||{}),...headers()};const r=await fetch(url,opts);const d=await r.json().catch(()=>({}));if(!r.ok||d.code){if(r.status===401)showLogin('Key 不正确或已失效。');throw new Error(d.message||r.statusText);}return d.data??d;} function showLogin(msg=''){ $('loginView').style.display='grid'; $('appView').style.display='none'; $('loginMsg').textContent=msg; } async function loadConfig(){try{const r=await fetch('/api/config'); const d=await r.json(); if(d.data&&typeof d.data.include_auto_approved_in_training==='boolean') $('includeAutoApproved').checked=d.data.include_auto_approved_in_training;}catch(e){}} async function showApp(){ $('loginView').style.display='none'; $('appView').style.display='block'; await loadConfig(); loadList().catch(e=>showLogin(e.message)); }
+$('loginBtn').onclick=async()=>{adminKey=$('loginKey').value.trim(); if(!adminKey){$('loginMsg').textContent='请输入 Key。';return;} try{await api('/api/admin/stats'); sessionStorage.setItem(KEY,adminKey); showApp();}catch(e){$('loginMsg').textContent=e.message;}}; $('loginKey').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click();}); $('logoutBtn').onclick=()=>{sessionStorage.removeItem(KEY);adminKey='';showLogin('已退出。');};
+function badge(s){return `<span class="badge ${esc(s)}">${esc(s)}</span>`;} async function loadStats(){const d=await api('/api/admin/stats'); const labels={needs_admin:'待人工',screening:'初筛中',auto_rejected:'自动拦截',approved:'待训练/已通过',rejected:'已拒绝'}; const keys=['needs_admin','screening','auto_rejected','approved','rejected']; $('stats').innerHTML=keys.map(k=>`<div class="stat"><span class="muted">${labels[k]}</span><b>${d.counts[k]||0}</b></div>`).join('');} async function loadList(){await loadStats(); const st=$('statusFilter').value; const d=await api('/api/admin/items?status='+encodeURIComponent(st)); $('list').innerHTML=d.items.map(renderItem).join(''); document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>review(b.dataset.id,b.dataset.action)); document.querySelectorAll('[data-zoom]').forEach(img=>img.onclick=()=>zoom(img.src));}
+function renderItem(it){const s=it.screen||{}, pair=(it.pair||[]).join(','); return `<article class="item"><div class="row" style="justify-content:space-between"><b title="${esc(it.filename)}">${esc(it.filename)}</b>${badge(it.status)}</div><img data-zoom src="${it.image_url}" alt="审核图片 ${esc(it.filename)}" loading="lazy"><div class="small muted">提交：pair=[${esc(pair)}] animal=${esc(it.animal||'')}</div><div class="small ${s.ok===false?'bad':'yellow'}">${esc(s.reason||'无初筛信息')} ${s.pred_pair?`预测=[${esc(s.pred_pair.join(','))}] ${esc(s.pred_animal||'')} score=${esc(s.confidence)}`:''}</div><div class="row"><label>pair <input id="pair-${esc(it.id)}" value="${esc(pair)}"></label><label>animal <input id="animal-${esc(it.id)}" value="${esc(it.animal||'')}"></label></div><textarea id="note-${esc(it.id)}" placeholder="备注">${esc(it.review_note||'')}</textarea><div class="row"><button class="success" data-action="approve" data-id="${esc(it.id)}">通过</button><button class="danger" data-action="reject" data-id="${esc(it.id)}">拒绝</button><button class="warnBtn" data-action="needs_admin" data-id="${esc(it.id)}">待审</button></div></article>`;}
+async function review(id,decision){const pair=document.getElementById('pair-'+id).value.split(',').map(x=>Number(x.trim())).filter(Boolean); const animal=document.getElementById('animal-'+id).value.trim(); const note=document.getElementById('note-'+id).value.trim(); try{await api('/api/admin/items/'+id+'/review',{method:'POST',body:JSON.stringify({decision,pair,animal,note})}); await loadList();}catch(e){alert(e.message);}}
+$('refreshBtn').onclick=loadList; $('statusFilter').onchange=loadList; $('trainBtn').onclick=async()=>{const p={run_name:$('runName').value.trim(),feature_mode:$('featureMode').value,epochs:Number($('epochs').value),val_ratio:Number($('valRatio').value),include_auto_approved:$('includeAutoApproved').checked}; $('trainStatus').textContent='启动中...'; try{const d=await api('/api/admin/train',{method:'POST',body:JSON.stringify(p)}); $('trainStatus').textContent=JSON.stringify(d,null,2); await loadStats();}catch(e){$('trainStatus').textContent=e.message;}}; $('trainStatusBtn').onclick=async()=>{try{const d=await api('/api/admin/train-status'); $('trainStatus').textContent=JSON.stringify(d,null,2);}catch(e){$('trainStatus').textContent=e.message;}}; function zoom(src){$('zoomImg').src=src; $('zoom').style.display='flex';} function closeZoom(){ $('zoom').style.display='none'; $('zoomImg').removeAttribute('src'); } $('zoomClose').onclick=closeZoom; $('zoom').onclick=e=>{if(e.target.id==='zoom')closeZoom();}; document.addEventListener('keydown',e=>{if(e.key==='Escape')closeZoom();}); if(adminKey){showApp();}else{showLogin();}
+</script></body></html>
 """
 
 
@@ -667,7 +569,14 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
             elif path == '/healthz':
                 self.ok({'ok': True})
             elif path == '/api/config':
-                self.ok({'max_images_per_batch': MAX_IMAGES_PER_BATCH, 'animals': ANIMALS})
+                self.ok({
+                    'max_images_per_batch': MAX_IMAGES_PER_BATCH,
+                    'animals': ANIMALS,
+                    'include_auto_approved_in_training': env_flag(
+                        'INCLUDE_AUTO_APPROVED_IN_TRAINING',
+                        DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING,
+                    ),
+                })
             elif path.startswith('/api/submissions/'):
                 self.handle_get_submission(path)
             elif path == '/api/admin/stats':
@@ -862,10 +771,13 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
                 item['pair'] = pair
                 item['animal'] = animal
                 item['status'] = 'approved'
+                item['reviewed_by'] = 'admin'
             elif decision == 'reject':
                 item['status'] = 'rejected'
+                item['reviewed_by'] = 'admin'
             else:
                 item['status'] = 'needs_admin'
+                item['reviewed_by'] = 'admin'
             item['review_note'] = str(payload.get('note') or '')
             item['reviewed_at'] = now_iso()
         self.store.save()
@@ -877,11 +789,15 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
         feature_mode = str(payload.get('feature_mode') or 'parts_v1')
         epochs = int(payload.get('epochs') or 180)
         val_ratio = float(payload.get('val_ratio') or 0.2)
+        include_auto_approved = bool(payload.get(
+            'include_auto_approved',
+            env_flag('INCLUDE_AUTO_APPROVED_IN_TRAINING', DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING),
+        ))
         if feature_mode not in {'parts_v1', 'processed_v2'}:
             raise ValueError('feature_mode 只能是 parts_v1 或 processed_v2。')
         if epochs < 1:
             raise ValueError('epochs 必须大于 0。')
-        job = self.trainer.start(run_name, feature_mode, epochs, val_ratio)
+        job = self.trainer.start(run_name, feature_mode, epochs, val_ratio, include_auto_approved)
         self.ok({'job': job})
 
     def handle_train_status(self) -> None:
@@ -926,6 +842,7 @@ def build_handler(store: StateStore, worker: ScreeningWorker, trainer: TrainingR
 
 
 def main() -> None:
+    load_env_file()
     parser = argparse.ArgumentParser(description='九重妖楼识别测试训练数据 Web 平台')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8091)
@@ -935,6 +852,9 @@ def main() -> None:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     store = StateStore(STATE_PATH)
+    promoted = auto_promote_matched_items(store)
+    if promoted:
+        print(f'auto-promoted matched pending items: {promoted}')
     worker = ScreeningWorker(store, args.reject_confidence)
     trainer = TrainingRunner(store)
     server = ThreadingHTTPServer((args.host, args.port), build_handler(store, worker, trainer, args.admin_key))
