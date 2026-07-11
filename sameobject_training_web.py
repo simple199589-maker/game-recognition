@@ -13,7 +13,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,6 +42,7 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_REJECT_CONFIDENCE = 0.80
 DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING = True
 IDENTIFY_CACHE_TTL_SECONDS = 60
+PLATFORM_LABELING_CLAIM_TTL_SECONDS = 30 * 60
 ANIMALS = ['', '野猪', '熊', '豹子', '蜘蛛', '鹿', '羊', '牛', '狼', '袋鼠', '不确定']
 
 
@@ -222,6 +223,90 @@ class StateStore:
                 image_path.unlink(missing_ok=True)
         if expired:
             self.save()
+
+    def release_expired_platform_claims(self) -> int:
+        """释放超时的领取批次，让图片重新回到平台待标注队列。"""
+        now = datetime.now()
+        released = 0
+        with self.lock:
+            expired_claims = []
+            for batch in self.state['batches'].values():
+                if batch.get('claim_kind') != 'platform_labeling' or batch.get('status') != 'labeling':
+                    continue
+                try:
+                    expires_at = datetime.fromisoformat(batch['claim_expires_at'])
+                except (KeyError, TypeError, ValueError):
+                    expires_at = now
+                if expires_at <= now:
+                    expired_claims.append(batch)
+            for claim in expired_claims:
+                for item_id in claim['item_ids']:
+                    item = self.state['items'].get(item_id)
+                    if not item:
+                        continue
+                    source_batch_id = item.pop('source_batch_id', None)
+                    if source_batch_id:
+                        source_batch = self.state['batches'].get(source_batch_id)
+                        if source_batch:
+                            source_batch['status'] = 'uploaded'
+                            source_batch.pop('claimed_at', None)
+                            source_batch.pop('claim_batch_id', None)
+                        item['batch_id'] = source_batch_id
+                    item['status'] = 'uploaded'
+                    item.pop('claimed_at', None)
+                self.state['batches'].pop(claim['id'], None)
+                released += 1
+        if released:
+            self.save()
+        return released
+
+    def claim_platform_labeling_batch(self) -> dict | None:
+        """一次领取最多 10 条平台反馈，并用短租约避免并发重复标注。"""
+        self.release_expired_platform_claims()
+        with self.lock:
+            candidates = []
+            source_batches = sorted(
+                (
+                    batch for batch in self.state['batches'].values()
+                    if batch.get('source') == 'identify_feedback' and batch.get('status') == 'uploaded'
+                ),
+                key=lambda batch: batch.get('created_at', ''),
+            )
+            for source_batch in source_batches:
+                for item_id in source_batch['item_ids']:
+                    item = self.state['items'].get(item_id)
+                    if item and item.get('status') == 'uploaded':
+                        candidates.append((source_batch, item))
+                    if len(candidates) == MAX_IMAGES_PER_BATCH:
+                        break
+                if len(candidates) == MAX_IMAGES_PER_BATCH:
+                    break
+            if not candidates:
+                return None
+
+            claim_id = f'platform-{uuid.uuid4().hex[:12]}'
+            claimed_at = now_iso()
+            expires_at = (datetime.now() + timedelta(seconds=PLATFORM_LABELING_CLAIM_TTL_SECONDS)).replace(microsecond=0).isoformat()
+            for source_batch, item in candidates:
+                source_batch['status'] = 'claimed'
+                source_batch['claimed_at'] = claimed_at
+                source_batch['claim_batch_id'] = claim_id
+                item['source_batch_id'] = source_batch['id']
+                item['batch_id'] = claim_id
+                item['status'] = 'labeling'
+                item['claimed_at'] = claimed_at
+            claim = {
+                'id': claim_id,
+                'source': 'identify_feedback',
+                'claim_kind': 'platform_labeling',
+                'status': 'labeling',
+                'created_at': claimed_at,
+                'claim_expires_at': expires_at,
+                'item_ids': [item['id'] for _, item in candidates],
+            }
+            self.state['batches'][claim_id] = claim
+        self.save()
+        return claim
 
     def create_identification(self, image_bytes: bytes, result: dict) -> str:
         """临时保存识别原图，以便客户端随后反馈错误。"""
@@ -611,7 +696,7 @@ USER_HTML = r"""<!doctype html>
 <header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="loadPlatformBtn">领取平台待标注</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
 <main><section class="panel stage"><div class="topline"><div><b id="title">等待上传</b> <span id="fileMeta" class="meta"></span></div><div class="pair" id="pairText">未选择</div></div><div class="viewer"><div id="imageWrap" class="imageWrap"><img id="captcha" alt="当前标注图片"></div></div></section><aside class="panel"><div class="row"><b>动物类别</b><span id="animalText" class="yellow">未选择</span></div><div id="animalGrid" class="animalGrid"></div><div class="row"><input id="animalOther" placeholder="自定义类别" style="flex:1;min-width:0"><button id="applyOtherBtn">应用</button></div><div class="row"><button id="clearPairBtn">清空当前</button><button id="refreshBtn" disabled>刷新初筛</button></div><div class="thumbs" id="thumbs"></div><div class="hint"><p><b>快捷键</b>：<span class="kbd">1-8</span> 选答案格，<span class="kbd">A/←</span> 上一张，<span class="kbd">D/→</span> 下一张，<span class="kbd">Enter</span> 下一张，<span class="kbd">Ctrl+Enter</span> 提交整轮。</p><p>每轮最多 10 张；所有图片都选好两个格子并填写类别后才可提交。</p></div><div id="status" class="status">请选择图片上传。</div></aside></main>
 <script>
-const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
+const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; const PLATFORM_BATCH_KEY='sameobject_platform_labeling_batch'; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
 function setStatus(t,cls=''){ $('status').className='status '+cls; $('status').textContent=t; } function esc(s){ return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); } async function api(url,opts={}){ const r=await fetch(url,opts); const d=await r.json().catch(()=>({})); if(!r.ok||d.code) throw new Error(d.message||r.statusText); return d.data??d; }
 function current(){ return batch?.items[idx]; } function ans(id){ if(!answers.has(id)) answers.set(id,{pair:[],animal:''}); return answers.get(id); } function completeItem(it){ const a=answers.get(it.id); return a&&a.pair.length===2&&a.animal; } function complete(){ return batch&&batch.items.every(completeItem); }
 function renderAnimals(){ const grid=$('animalGrid'); grid.innerHTML=''; const a=current()?ans(current().id):{animal:''}; for(const animal of animals.filter(Boolean)){ const b=document.createElement('button'); b.textContent=animal; b.className=a.animal===animal?'active':''; b.onclick=()=>{ if(!current())return; ans(current().id).animal=animal; render(); }; grid.appendChild(b); } }
@@ -620,11 +705,12 @@ function render(){ const it=current(); $('submitBtn').disabled=!complete(); $('r
 function clearBoxes(){ document.querySelectorAll('.box').forEach(x=>x.remove()); } function drawBoxes(){ clearBoxes(); const it=current(); if(!it)return; const img=$('captcha'), wrap=$('imageWrap'), a=ans(it.id); const sx=img.clientWidth/it.size[0], sy=img.clientHeight/it.size[1]; it.boxes.forEach((b,i)=>{ const n=i+1, div=document.createElement('button'); div.type='button'; div.className='box '+(a.pair.includes(n)?'selected':''); div.style.left=(b[0]*sx)+'px'; div.style.top=(b[1]*sy)+'px'; div.style.width=(b[2]*sx)+'px'; div.style.height=(b[3]*sy)+'px'; div.innerHTML=`<span class="num">${n}</span>${a.pair.includes(n)&&a.animal?`<span class="tag">${esc(a.animal)}</span>`:''}`; div.onclick=()=>toggle(n); wrap.appendChild(div); }); }
 function toggle(n){ const it=current(); if(!it)return; const a=ans(it.id); if(a.pair.includes(n)) a.pair=a.pair.filter(x=>x!==n); else { if(a.pair.length>=2)a.pair.shift(); a.pair.push(n); a.pair.sort((x,y)=>x-y); } render(); } function move(d){ if(!batch)return; idx=(idx+d+batch.items.length)%batch.items.length; render(); }
 $('uploadBtn').onclick=async()=>{ const files=[...$('fileInput').files]; if(files.length<1||files.length>10){setStatus('请选择 1-10 张图片。','bad');return;} const fd=new FormData(); files.forEach(f=>fd.append('images',f)); $('uploadBtn').disabled=true; setStatus('上传并切格中...'); try{ batch=await api('/api/uploads',{method:'POST',body:fd}); idx=0; answers.clear(); render(); setStatus('上传完成，按 1-8 勾选答案。','ok'); }catch(e){setStatus(e.message,'bad');}finally{$('uploadBtn').disabled=false;} };
-$('loadPlatformBtn').onclick=async()=>{ $('loadPlatformBtn').disabled=true; try{ const d=await api('/api/platform-labeling/next'); if(!d.batch_id){setStatus('暂无平台待标注图片。','yellow');return;} batch=d; idx=0; answers.clear(); render(); setStatus('已领取平台反馈图片，请完成标注后提交。','ok'); }catch(e){setStatus(e.message,'bad');}finally{$('loadPlatformBtn').disabled=false;} };
+function usePlatformBatch(d,msg){ batch=d; idx=0; answers.clear(); localStorage.setItem(PLATFORM_BATCH_KEY,d.batch_id); render(); setStatus(msg,'ok'); } async function restorePlatformBatch(){ const batchId=localStorage.getItem(PLATFORM_BATCH_KEY); if(!batchId)return; try{ const d=await api('/api/submissions/'+encodeURIComponent(batchId)); if(d.source==='identify_feedback'&&d.status==='labeling'){ usePlatformBatch(d,'已恢复未完成的平台标注批次。'); }else{ localStorage.removeItem(PLATFORM_BATCH_KEY); } }catch(e){ localStorage.removeItem(PLATFORM_BATCH_KEY); } }
+$('loadPlatformBtn').onclick=async()=>{ $('loadPlatformBtn').disabled=true; try{ const savedId=localStorage.getItem(PLATFORM_BATCH_KEY); if(savedId){ const saved=await api('/api/submissions/'+encodeURIComponent(savedId)).catch(()=>null); if(saved?.source==='identify_feedback'&&saved.status==='labeling'){ usePlatformBatch(saved,'已恢复未完成的平台标注批次。'); return; } localStorage.removeItem(PLATFORM_BATCH_KEY); } const d=await api('/api/platform-labeling/next'); if(!d.batch_id){setStatus('暂无平台待标注图片。','yellow');return;} usePlatformBatch(d,`已领取 ${d.items.length} 张平台反馈图片，请在 30 分钟内完成标注。`); }catch(e){setStatus(e.message,'bad');}finally{$('loadPlatformBtn').disabled=false;} };
 $('prevBtn').onclick=()=>move(-1); $('nextBtn').onclick=()=>move(1); $('clearPairBtn').onclick=()=>{ const it=current(); if(!it)return; answers.set(it.id,{pair:[],animal:ans(it.id).animal}); render(); }; $('applyOtherBtn').onclick=()=>{ const it=current(), v=$('animalOther').value.trim(); if(it&&v){ ans(it.id).animal=v; render(); }};
-$('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('提交中...'); try{ const d=await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); setStatus(d.status==='approved'?'平台反馈已标注，进入待训练数据。':'提交成功，后台初筛中。','ok'); }catch(e){setStatus(e.message,'bad'); render();} };
+$('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('提交中...'); try{ const d=await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); if(batch.source==='identify_feedback')localStorage.removeItem(PLATFORM_BATCH_KEY); setStatus(d.status==='approved'?'平台反馈已标注，进入待训练数据。':'提交成功，后台初筛中。','ok'); }catch(e){setStatus(e.message,'bad'); render();} };
 $('refreshBtn').onclick=async()=>{ if(!batch)return; try{ const d=await api(`/api/submissions/${batch.batch_id}`); setStatus('批次状态：'+d.status+'\n'+d.items.map(x=>`${x.filename}: ${x.status}${x.screen?.reason?' - '+x.screen.reason:''}`).join('\n'),'yellow'); }catch(e){setStatus(e.message,'bad');} };
-window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render();
+window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render(); restorePlatformBatch();
 </script></body></html>
 """
 
@@ -823,11 +909,14 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
         if not isinstance(answers, list):
             raise ValueError('answers 必须是数组。')
         by_id = {row.get('item_id'): row for row in answers if isinstance(row, dict)}
+        self.store.release_expired_platform_claims()
         with self.store.lock:
             batch = self.store.state['batches'].get(batch_id)
             if not batch:
                 raise ValueError('批次不存在。')
-            if batch['status'] not in {'uploaded'}:
+            is_platform_claim = batch.get('claim_kind') == 'platform_labeling'
+            allowed_statuses = {'labeling'} if is_platform_claim else {'uploaded'}
+            if batch['status'] not in allowed_statuses:
                 raise ValueError('该批次已经提交过。')
             if set(by_id) != set(batch['item_ids']):
                 raise ValueError('必须完成当前批次全部图片后再提交。')
@@ -853,6 +942,10 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
                     item['reviewed_by'] = 'platform_labeler'
                     item['review_note'] = 'platform feedback labeled'
                     item['reviewed_at'] = now_iso()
+                    source_batch = self.store.state['batches'].get(item.get('source_batch_id'))
+                    if source_batch:
+                        source_batch['status'] = 'approved'
+                        source_batch['submitted_at'] = now_iso()
             batch['status'] = 'approved' if batch.get('source') == 'identify_feedback' else 'queued'
             batch['submitted_at'] = now_iso()
         self.store.save()
@@ -861,22 +954,20 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
         self.ok({'batch_id': batch_id, 'status': batch['status']})
 
     def handle_get_platform_labeling(self) -> None:
+        batch = self.store.claim_platform_labeling_batch()
+        if not batch:
+            self.ok({'batch_id': None, 'items': []})
+            return
         with self.store.lock:
-            batches = [
-                batch for batch in self.store.state['batches'].values()
-                if batch.get('source') == 'identify_feedback' and batch.get('status') == 'uploaded'
-            ]
-            if not batches:
-                self.ok({'batch_id': None, 'items': []})
-                return
-            batch = min(batches, key=lambda row: row.get('created_at', ''))
             items = [self.public_item(self.store.state['items'][item_id]) for item_id in batch['item_ids']]
             data = dict(batch)
+            data['batch_id'] = batch['id']
             data['items'] = items
         self.ok(data)
 
     def handle_get_submission(self, path: str) -> None:
         batch_id = path.split('/')[3]
+        self.store.release_expired_platform_claims()
         with self.store.lock:
             batch = self.store.state['batches'].get(batch_id)
             if not batch:
@@ -884,6 +975,7 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
                 return
             items = [self.public_item(self.store.state['items'][item_id]) for item_id in batch['item_ids']]
             data = dict(batch)
+            data['batch_id'] = batch['id']
             data['items'] = items
         self.ok(data)
 
