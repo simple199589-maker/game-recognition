@@ -8,6 +8,8 @@ services:
     environment:
       SAMEOBJECT_API_KEY: ${SAMEOBJECT_API_KEY:?set SAMEOBJECT_API_KEY before starting}
       TRAINING_WEB_ADMIN_KEY: ${TRAINING_WEB_ADMIN_KEY:?set TRAINING_WEB_ADMIN_KEY before starting}
+      TRAINING_WEB_REJECT_CONFIDENCE: ${TRAINING_WEB_REJECT_CONFIDENCE:-0.80}
+      INCLUDE_AUTO_APPROVED_IN_TRAINING: ${INCLUDE_AUTO_APPROVED_IN_TRAINING:-1}
     command: ["--enable-training-web"]
     volumes:
       - ./training_web_data:/app/training_web_data
