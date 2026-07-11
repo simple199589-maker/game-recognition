@@ -1,0 +1,22 @@
+services:
+  sameobject-trainer:
+    build:
+      context: .
+    profiles: ["training"]
+    working_dir: /app
+    entrypoint: ["python"]
+    command:
+      - tools/train_sameobject_animal_classifier.py
+      - --run-name
+      - docker_parts_v1
+      - --feature-mode
+      - parts_v1
+      - --epochs
+      - "180"
+      - --val-ratio
+      - "0.2"
+    volumes:
+      - ./images:/app/images:ro
+      - ./datasets:/app/datasets
+      - ./image_archive:/app/image_archive:ro
+      - ./training_runs:/app/training_runs

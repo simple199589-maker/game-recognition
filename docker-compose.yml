@@ -1,0 +1,17 @@
+services:
+  sameobject-api:
+    build:
+      context: .
+    container_name: sameobject-api
+    ports:
+      - "8090:8090"
+    environment:
+      SAMEOBJECT_API_KEY: ${SAMEOBJECT_API_KEY:?set SAMEOBJECT_API_KEY before starting}
+      TRAINING_WEB_ADMIN_KEY: ${TRAINING_WEB_ADMIN_KEY:?set TRAINING_WEB_ADMIN_KEY before starting}
+    command: ["--enable-training-web"]
+    volumes:
+      - ./training_web_data:/app/training_web_data
+      - ./images:/app/images
+      - ./datasets:/app/datasets
+      - ./training_runs:/app/training_runs
+    restart: unless-stopped
