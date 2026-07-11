@@ -75,6 +75,7 @@ X-API-Key: <your-api-key>
   "code": 0,
   "data": {
     "positions": [1, 8],
+    "identify_id": "7b5e4bba8ce34b4b9a3b5fce5bdbddca",
     "animal": "羊",
     "confidence": 0.954274,
     "click_centers": [[113, 165], [593, 325]],
@@ -88,10 +89,45 @@ X-API-Key: <your-api-key>
 字段说明：
 
 - `positions`：预测出的两个格子序号，按从左到右、从上到下编号 `1-8`。
+- `identify_id`：本次识别的唯一编号。客户端应保存该值，用于后续正确性反馈。
 - `animal`：预测的共同动物类别。
 - `confidence`：融合模型对第一候选 pair 的分数。
 - `click_centers`：原图坐标系中的两个点击中心点。
 - `top_pairs`：前 5 个候选，按分数降序。
+
+## Identify Feedback
+
+`POST /api/identify/feedback`
+
+上报 `identify_id` 对应识别结果是否正确。接口与识别接口使用相同的 API Key；重复提交相同结果是幂等的。`correct` 为 `false` 时，服务端会保存原图并将该记录放入用户训练标注页的“领取平台待标注”队列；标注提交后直接进入待训练数据，不进入管理员审核。`correct` 为 `true` 时只记录反馈并删除临时原图；未反馈记录不会进入标注、审核或训练流程，并在 60 秒后清理。
+
+```json
+{
+  "identify_id": "7b5e4bba8ce34b4b9a3b5fce5bdbddca",
+  "correct": false
+}
+```
+
+响应示例：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "identify_id": "7b5e4bba8ce34b4b9a3b5fce5bdbddca",
+    "correct": false,
+    "queued_for_labeling": true,
+    "label_item_id": "f22a4f1e5b6c"
+  }
+}
+```
+
+PowerShell：
+
+```powershell
+$body = @{ identify_id = $identifyId; correct = $false } | ConvertTo-Json -Compress
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8090/api/identify/feedback" -ContentType "application/json" -Headers @{ "X-API-Key" = $key } -Body $body
+```
 
 ### Errors
 

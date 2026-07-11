@@ -98,7 +98,7 @@ def decode_json_image(body: bytes) -> bytes:
         raise ValueError('img 不是有效 base64 图片数据。') from exc
 
 
-def build_handler(identifier: Identifier, api_key: str, training_web_base=None):
+def build_handler(identifier: Identifier, api_key: str, store, training_web_base=None):
     base_class = training_web_base or BaseHTTPRequestHandler
 
     class IdentifyHandler(base_class):
@@ -128,14 +128,14 @@ def build_handler(identifier: Identifier, api_key: str, training_web_base=None):
             self.send_response(HTTPStatus.NO_CONTENT)
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-API-Key, Authorization')
             self.end_headers()
 
         def do_GET(self) -> None:
             path = urlparse(self.path).path
             if path == '/healthz':
                 self.send_json(HTTPStatus.OK, {'ok': True})
-            elif path == '/api/identify/image':
+            elif path in {'/api/identify/image', '/api/identify/feedback'}:
                 self.send_json(HTTPStatus.METHOD_NOT_ALLOWED, {'code': 405, 'message': '该接口只接受 POST 请求。'})
             elif training_web_base is not None:
                 super().do_GET()
@@ -144,7 +144,7 @@ def build_handler(identifier: Identifier, api_key: str, training_web_base=None):
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
-            if path != '/api/identify/image':
+            if path not in {'/api/identify/image', '/api/identify/feedback'}:
                 if training_web_base is not None:
                     super().do_POST()
                     return
@@ -155,6 +155,9 @@ def build_handler(identifier: Identifier, api_key: str, training_web_base=None):
                 return
 
             try:
+                if path == '/api/identify/feedback':
+                    self.handle_feedback()
+                    return
                 content_length = int(self.headers.get('Content-Length', '0'))
                 if not 0 < content_length <= MAX_IMAGE_BYTES * 2:
                     raise ValueError('请求体大小必须在 1 字节到 20 MB 之间。')
@@ -164,9 +167,11 @@ def build_handler(identifier: Identifier, api_key: str, training_web_base=None):
                 if not 0 < len(image_bytes) <= MAX_IMAGE_BYTES:
                     raise ValueError('解码后的图片大小必须在 1 字节到 10 MB 之间。')
                 result = identifier.identify(image_bytes)
+                identify_id = store.create_identification(image_bytes, result)
                 response = {
                     'code': 0,
                     'data': {
+                        'identify_id': identify_id,
                         'positions': result['best_pair'],
                         'animal': result['best_animal'],
                         'confidence': result['best_score'],
@@ -180,6 +185,20 @@ def build_handler(identifier: Identifier, api_key: str, training_web_base=None):
             except Exception as exc:
                 print('identify error:', repr(exc))
                 self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {'code': 500, 'message': '识别失败。'})
+
+        def handle_feedback(self) -> None:
+            content_length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < content_length <= 64 * 1024:
+                raise ValueError('反馈请求体大小必须在 1 字节到 64 KB 之间。')
+            payload = json.loads(self.rfile.read(content_length).decode('utf-8'))
+            identify_id = str(payload.get('identify_id') or '').strip()
+            correct = payload.get('correct')
+            if not identify_id:
+                raise ValueError('identify_id 不能为空。')
+            if not isinstance(correct, bool):
+                raise ValueError('correct 必须是布尔值 true 或 false。')
+            data = store.report_identification_feedback(identify_id, correct)
+            self.send_json(HTTPStatus.OK, {'code': 0, 'data': data})
 
     return IdentifyHandler
 
@@ -225,22 +244,22 @@ def main() -> None:
         Path(args.parts_weights).resolve(),
         args.parts_weight,
     )
+    from sameobject_training_web import (  # noqa: WPS433
+        DATA_DIR,
+        STATE_PATH,
+        ScreeningWorker,
+        StateStore,
+        TrainingRunner,
+        auto_promote_matched_items,
+        build_handler as build_training_web_handler,
+    )
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    store = StateStore(STATE_PATH)
     training_web_base = None
     if args.enable_training_web:
         if not args.training_web_admin_key:
             raise SystemExit('启用 --enable-training-web 时必须通过 --training-web-admin-key 或环境变量 TRAINING_WEB_ADMIN_KEY 设置管理员 Key。')
-        from sameobject_training_web import (  # noqa: WPS433
-            DATA_DIR,
-            STATE_PATH,
-            ScreeningWorker,
-            StateStore,
-            TrainingRunner,
-            auto_promote_matched_items,
-            build_handler as build_training_web_handler,
-        )
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        store = StateStore(STATE_PATH)
         promoted = auto_promote_matched_items(store)
         if promoted:
             print(f'auto-promoted matched pending items: {promoted}')
@@ -248,7 +267,7 @@ def main() -> None:
         trainer = TrainingRunner(store)
         training_web_base = build_training_web_handler(store, worker, trainer, args.training_web_admin_key)
 
-    server = ThreadingHTTPServer((args.host, args.port), build_handler(identifier, args.api_key, training_web_base))
+    server = ThreadingHTTPServer((args.host, args.port), build_handler(identifier, args.api_key, store, training_web_base))
     print(f'listening on http://{args.host}:{args.port}')
     if args.enable_training_web:
         print('training web mounted on same port: / and /admin')

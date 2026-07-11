@@ -9,6 +9,7 @@
 - 本地 HTTP 识别接口：`POST /api/identify/image`
 - 支持 JSON Base64 或图片二进制上传
 - 返回预测格子、共同动物类别、置信度和点击中心点
+- 每次识别返回唯一 `identify_id`，可通过反馈接口将错误识别自动送入待标注队列
 - 可选的训练数据提交/管理员审核 Web 页面
 - 训练和预处理脚本保留在 `tools/` 目录，便于继续实验
 
@@ -79,6 +80,7 @@ Invoke-RestMethod `
   "code": 0,
   "data": {
     "positions": [1, 8],
+    "identify_id": "7b5e4bba8ce34b4b9a3b5fce5bdbddca",
     "animal": "羊",
     "confidence": 0.954274,
     "click_centers": [[113, 165], [593, 325]],

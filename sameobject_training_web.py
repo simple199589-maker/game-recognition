@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover - 允许只跑 Web，不跑自动切格
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / 'training_web_data'
 UPLOAD_DIR = DATA_DIR / 'uploads'
+IDENTIFY_RECORD_DIR = DATA_DIR / 'identify_records'
 TRAIN_LOG_DIR = DATA_DIR / 'train_logs'
 STATE_PATH = DATA_DIR / 'state.json'
 APPROVED_IMAGE_DIR = ROOT_DIR / 'images' / 'training_web'
@@ -40,6 +41,7 @@ MAX_IMAGES_PER_BATCH = 10
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_REJECT_CONFIDENCE = 0.80
 DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING = True
+IDENTIFY_CACHE_TTL_SECONDS = 60
 ANIMALS = ['', '野猪', '熊', '豹子', '蜘蛛', '鹿', '羊', '牛', '狼', '袋鼠', '不确定']
 
 
@@ -172,12 +174,14 @@ class StateStore:
         self.path = path
         self.lock = threading.RLock()
         self.state = load_json(path, {
-            'version': 1,
+            'version': 2,
             'created_at': now_iso(),
             'batches': {},
             'items': {},
+            'identifications': {},
             'train_jobs': {},
         })
+        self.state.setdefault('identifications', {})
 
     def save(self) -> None:
         with self.lock:
@@ -191,8 +195,135 @@ class StateStore:
         with self.lock:
             counts: dict[str, int] = {}
             for item in self.state['items'].values():
+                if item.get('source') == 'identify_feedback':
+                    continue
                 counts[item['status']] = counts.get(item['status'], 0) + 1
             return counts
+
+    def cleanup_expired_identifications(self) -> None:
+        """清理未反馈的临时识别缓存；它们不会进入标注或训练流程。"""
+        cutoff = time.time() - IDENTIFY_CACHE_TTL_SECONDS
+        expired = []
+        with self.lock:
+            for identify_id, record in self.state['identifications'].items():
+                if record.get('feedback'):
+                    continue
+                try:
+                    created_at = datetime.fromisoformat(record['created_at']).timestamp()
+                except (KeyError, TypeError, ValueError):
+                    created_at = 0
+                if created_at < cutoff:
+                    expired.append((identify_id, record.get('image_path', '')))
+            for identify_id, _ in expired:
+                self.state['identifications'].pop(identify_id, None)
+        for _, image_rel in expired:
+            image_path = (ROOT_DIR / image_rel).resolve()
+            if str(image_path).startswith(str(DATA_DIR.resolve())):
+                image_path.unlink(missing_ok=True)
+        if expired:
+            self.save()
+
+    def create_identification(self, image_bytes: bytes, result: dict) -> str:
+        """临时保存识别原图，以便客户端随后反馈错误。"""
+        self.cleanup_expired_identifications()
+        identify_id = uuid.uuid4().hex
+        suffix = safe_ext('identify.png', image_bytes)
+        record_dir = IDENTIFY_RECORD_DIR / identify_id[:2]
+        record_dir.mkdir(parents=True, exist_ok=True)
+        image_path = record_dir / f'{identify_id}{suffix}'
+        image_path.write_bytes(image_bytes)
+        try:
+            with Image.open(image_path) as image:
+                size = list(image.size)
+        except Exception:
+            image_path.unlink(missing_ok=True)
+            raise
+
+        record = {
+            'id': identify_id,
+            'image_path': posix_rel(image_path),
+            'filename': f'identify_{identify_id}{suffix}',
+            'sha256': sha256_bytes(image_bytes),
+            'size': size,
+            'boxes': [list(map(int, box)) for box in result.get('boxes', [])],
+            'prediction': {
+                'pair': result.get('best_pair', []),
+                'animal': result.get('best_animal', ''),
+                'confidence': result.get('best_score', 0),
+                'top_pairs': result.get('top_pairs', []),
+            },
+            'created_at': now_iso(),
+        }
+        with self.lock:
+            self.state['identifications'][identify_id] = record
+        self.save()
+        return identify_id
+
+    def report_identification_feedback(self, identify_id: str, correct: bool) -> dict:
+        """记录识别反馈；错误结果只创建一次待人工标注项。"""
+        with self.lock:
+            record = self.state['identifications'].get(identify_id)
+            if not record:
+                raise ValueError('identify_id 不存在或已过期。')
+            previous = record.get('feedback')
+            if previous is not None and previous.get('correct') != correct:
+                raise ValueError('该识别编号已上报相反的反馈，不能覆盖。')
+            if previous is not None:
+                return {
+                    'identify_id': identify_id,
+                    'correct': correct,
+                    'queued_for_labeling': bool(previous.get('item_id')),
+                    'label_item_id': previous.get('item_id'),
+                }
+
+            feedback = {'correct': correct, 'reported_at': now_iso()}
+            if correct:
+                image_path = (ROOT_DIR / record['image_path']).resolve()
+                if str(image_path).startswith(str(DATA_DIR.resolve())):
+                    image_path.unlink(missing_ok=True)
+                record['image_deleted_at'] = now_iso()
+            else:
+                item_id = uuid.uuid4().hex[:12]
+                batch_id = f'feedback-{uuid.uuid4().hex[:12]}'
+                prediction = record['prediction']
+                item = {
+                    'id': item_id,
+                    'batch_id': batch_id,
+                    'source': 'identify_feedback',
+                    'identification_id': identify_id,
+                    'filename': record['filename'],
+                    'upload_path': record['image_path'],
+                    'sha256': record['sha256'],
+                    'size': record['size'],
+                    'boxes': record['boxes'],
+                    'box_source': 'identify_api',
+                    'status': 'uploaded',
+                    'created_at': now_iso(),
+                    'platform_feedback': {
+                        'reason': '客户端反馈识别错误，等待平台标注。',
+                        'pred_pair': prediction['pair'],
+                        'pred_animal': prediction['animal'],
+                        'confidence': prediction['confidence'],
+                        'top_pairs': prediction['top_pairs'],
+                    },
+                }
+                self.state['batches'][batch_id] = {
+                    'id': batch_id,
+                    'source': 'identify_feedback',
+                    'status': 'uploaded',
+                    'created_at': now_iso(),
+                    'item_ids': [item_id],
+                }
+                self.state['items'][item_id] = item
+                feedback['item_id'] = item_id
+            record['feedback'] = feedback
+        self.save()
+        return {
+            'identify_id': identify_id,
+            'correct': correct,
+            'queued_for_labeling': not correct,
+            'label_item_id': feedback.get('item_id'),
+        }
 
 
 def auto_promote_matched_items(store: StateStore) -> int:
@@ -477,7 +608,7 @@ USER_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-<header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
+<header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="loadPlatformBtn">领取平台待标注</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
 <main><section class="panel stage"><div class="topline"><div><b id="title">等待上传</b> <span id="fileMeta" class="meta"></span></div><div class="pair" id="pairText">未选择</div></div><div class="viewer"><div id="imageWrap" class="imageWrap"><img id="captcha" alt="当前标注图片"></div></div></section><aside class="panel"><div class="row"><b>动物类别</b><span id="animalText" class="yellow">未选择</span></div><div id="animalGrid" class="animalGrid"></div><div class="row"><input id="animalOther" placeholder="自定义类别" style="flex:1;min-width:0"><button id="applyOtherBtn">应用</button></div><div class="row"><button id="clearPairBtn">清空当前</button><button id="refreshBtn" disabled>刷新初筛</button></div><div class="thumbs" id="thumbs"></div><div class="hint"><p><b>快捷键</b>：<span class="kbd">1-8</span> 选答案格，<span class="kbd">A/←</span> 上一张，<span class="kbd">D/→</span> 下一张，<span class="kbd">Enter</span> 下一张，<span class="kbd">Ctrl+Enter</span> 提交整轮。</p><p>每轮最多 10 张；所有图片都选好两个格子并填写类别后才可提交。</p></div><div id="status" class="status">请选择图片上传。</div></aside></main>
 <script>
 const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
@@ -489,8 +620,9 @@ function render(){ const it=current(); $('submitBtn').disabled=!complete(); $('r
 function clearBoxes(){ document.querySelectorAll('.box').forEach(x=>x.remove()); } function drawBoxes(){ clearBoxes(); const it=current(); if(!it)return; const img=$('captcha'), wrap=$('imageWrap'), a=ans(it.id); const sx=img.clientWidth/it.size[0], sy=img.clientHeight/it.size[1]; it.boxes.forEach((b,i)=>{ const n=i+1, div=document.createElement('button'); div.type='button'; div.className='box '+(a.pair.includes(n)?'selected':''); div.style.left=(b[0]*sx)+'px'; div.style.top=(b[1]*sy)+'px'; div.style.width=(b[2]*sx)+'px'; div.style.height=(b[3]*sy)+'px'; div.innerHTML=`<span class="num">${n}</span>${a.pair.includes(n)&&a.animal?`<span class="tag">${esc(a.animal)}</span>`:''}`; div.onclick=()=>toggle(n); wrap.appendChild(div); }); }
 function toggle(n){ const it=current(); if(!it)return; const a=ans(it.id); if(a.pair.includes(n)) a.pair=a.pair.filter(x=>x!==n); else { if(a.pair.length>=2)a.pair.shift(); a.pair.push(n); a.pair.sort((x,y)=>x-y); } render(); } function move(d){ if(!batch)return; idx=(idx+d+batch.items.length)%batch.items.length; render(); }
 $('uploadBtn').onclick=async()=>{ const files=[...$('fileInput').files]; if(files.length<1||files.length>10){setStatus('请选择 1-10 张图片。','bad');return;} const fd=new FormData(); files.forEach(f=>fd.append('images',f)); $('uploadBtn').disabled=true; setStatus('上传并切格中...'); try{ batch=await api('/api/uploads',{method:'POST',body:fd}); idx=0; answers.clear(); render(); setStatus('上传完成，按 1-8 勾选答案。','ok'); }catch(e){setStatus(e.message,'bad');}finally{$('uploadBtn').disabled=false;} };
+$('loadPlatformBtn').onclick=async()=>{ $('loadPlatformBtn').disabled=true; try{ const d=await api('/api/platform-labeling/next'); if(!d.batch_id){setStatus('暂无平台待标注图片。','yellow');return;} batch=d; idx=0; answers.clear(); render(); setStatus('已领取平台反馈图片，请完成标注后提交。','ok'); }catch(e){setStatus(e.message,'bad');}finally{$('loadPlatformBtn').disabled=false;} };
 $('prevBtn').onclick=()=>move(-1); $('nextBtn').onclick=()=>move(1); $('clearPairBtn').onclick=()=>{ const it=current(); if(!it)return; answers.set(it.id,{pair:[],animal:ans(it.id).animal}); render(); }; $('applyOtherBtn').onclick=()=>{ const it=current(), v=$('animalOther').value.trim(); if(it&&v){ ans(it.id).animal=v; render(); }};
-$('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('已提交，后台初筛中...'); try{ await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); setStatus('提交成功。可以稍后刷新初筛结果。','ok'); }catch(e){setStatus(e.message,'bad'); render();} };
+$('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('提交中...'); try{ const d=await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); setStatus(d.status==='approved'?'平台反馈已标注，进入待训练数据。':'提交成功，后台初筛中。','ok'); }catch(e){setStatus(e.message,'bad'); render();} };
 $('refreshBtn').onclick=async()=>{ if(!batch)return; try{ const d=await api(`/api/submissions/${batch.batch_id}`); setStatus('批次状态：'+d.status+'\n'+d.items.map(x=>`${x.filename}: ${x.status}${x.screen?.reason?' - '+x.screen.reason:''}`).join('\n'),'yellow'); }catch(e){setStatus(e.message,'bad');} };
 window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render();
 </script></body></html>
@@ -506,7 +638,7 @@ ADMIN_HTML = r"""<!doctype html>
 <script>
 const KEY='sameobject_admin_key'; const $=id=>document.getElementById(id); let adminKey=sessionStorage.getItem(KEY)||''; function esc(s){return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));} function headers(){return {'Content-Type':'application/json','X-Admin-Key':adminKey};} async function api(url,opts={}){opts.headers={...(opts.headers||{}),...headers()};const r=await fetch(url,opts);const d=await r.json().catch(()=>({}));if(!r.ok||d.code){if(r.status===401)showLogin('Key 不正确或已失效。');throw new Error(d.message||r.statusText);}return d.data??d;} function showLogin(msg=''){ $('loginView').style.display='grid'; $('appView').style.display='none'; $('loginMsg').textContent=msg; } async function loadConfig(){try{const r=await fetch('/api/config'); const d=await r.json(); if(d.data&&typeof d.data.include_auto_approved_in_training==='boolean') $('includeAutoApproved').checked=d.data.include_auto_approved_in_training;}catch(e){}} async function showApp(){ $('loginView').style.display='none'; $('appView').style.display='block'; await loadConfig(); loadList().catch(e=>showLogin(e.message)); }
 $('loginBtn').onclick=async()=>{adminKey=$('loginKey').value.trim(); if(!adminKey){$('loginMsg').textContent='请输入 Key。';return;} try{await api('/api/admin/stats'); sessionStorage.setItem(KEY,adminKey); showApp();}catch(e){$('loginMsg').textContent=e.message;}}; $('loginKey').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click();}); $('logoutBtn').onclick=()=>{sessionStorage.removeItem(KEY);adminKey='';showLogin('已退出。');};
-function badge(s){return `<span class="badge ${esc(s)}">${esc(s)}</span>`;} async function loadStats(){const d=await api('/api/admin/stats'); const labels={needs_admin:'待人工',screening:'初筛中',auto_rejected:'自动拦截',approved:'待训练/已通过',rejected:'已拒绝'}; const keys=['needs_admin','screening','auto_rejected','approved','rejected']; $('stats').innerHTML=keys.map(k=>`<div class="stat"><span class="muted">${labels[k]}</span><b>${d.counts[k]||0}</b></div>`).join('');} async function loadList(){await loadStats(); const st=$('statusFilter').value; const d=await api('/api/admin/items?status='+encodeURIComponent(st)); $('list').innerHTML=d.items.map(renderItem).join(''); document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>review(b.dataset.id,b.dataset.action)); document.querySelectorAll('[data-zoom]').forEach(img=>img.onclick=()=>zoom(img.src));}
+function badge(s){return `<span class="badge ${esc(s)}">${esc(s)}</span>`;} async function loadStats(){const d=await api('/api/admin/stats'); const labels={needs_admin:'待标注/待人工',screening:'初筛中',auto_rejected:'自动拦截',approved:'待训练/已通过',rejected:'已拒绝'}; const keys=['needs_admin','screening','auto_rejected','approved','rejected']; $('stats').innerHTML=keys.map(k=>`<div class="stat"><span class="muted">${labels[k]}</span><b>${d.counts[k]||0}</b></div>`).join('');} async function loadList(){await loadStats(); const st=$('statusFilter').value; const d=await api('/api/admin/items?status='+encodeURIComponent(st)); $('list').innerHTML=d.items.map(renderItem).join(''); document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>review(b.dataset.id,b.dataset.action)); document.querySelectorAll('[data-zoom]').forEach(img=>img.onclick=()=>zoom(img.src));}
 function renderItem(it){const s=it.screen||{}, pair=(it.pair||[]).join(','); return `<article class="item"><div class="row" style="justify-content:space-between"><b title="${esc(it.filename)}">${esc(it.filename)}</b>${badge(it.status)}</div><img data-zoom src="${it.image_url}" alt="审核图片 ${esc(it.filename)}" loading="lazy"><div class="small muted">提交：pair=[${esc(pair)}] animal=${esc(it.animal||'')}</div><div class="small ${s.ok===false?'bad':'yellow'}">${esc(s.reason||'无初筛信息')} ${s.pred_pair?`预测=[${esc(s.pred_pair.join(','))}] ${esc(s.pred_animal||'')} score=${esc(s.confidence)}`:''}</div><div class="row"><label>pair <input id="pair-${esc(it.id)}" value="${esc(pair)}"></label><label>animal <input id="animal-${esc(it.id)}" value="${esc(it.animal||'')}"></label></div><textarea id="note-${esc(it.id)}" placeholder="备注">${esc(it.review_note||'')}</textarea><div class="row"><button class="success" data-action="approve" data-id="${esc(it.id)}">通过</button><button class="danger" data-action="reject" data-id="${esc(it.id)}">拒绝</button><button class="warnBtn" data-action="needs_admin" data-id="${esc(it.id)}">待审</button></div></article>`;}
 async function review(id,decision){const pair=document.getElementById('pair-'+id).value.split(',').map(x=>Number(x.trim())).filter(Boolean); const animal=document.getElementById('animal-'+id).value.trim(); const note=document.getElementById('note-'+id).value.trim(); try{await api('/api/admin/items/'+id+'/review',{method:'POST',body:JSON.stringify({decision,pair,animal,note})}); await loadList();}catch(e){alert(e.message);}}
 $('refreshBtn').onclick=loadList; $('statusFilter').onchange=loadList; $('trainBtn').onclick=async()=>{const p={run_name:$('runName').value.trim(),feature_mode:$('featureMode').value,epochs:Number($('epochs').value),val_ratio:Number($('valRatio').value),include_auto_approved:$('includeAutoApproved').checked}; $('trainStatus').textContent='启动中...'; try{const d=await api('/api/admin/train',{method:'POST',body:JSON.stringify(p)}); $('trainStatus').textContent=JSON.stringify(d,null,2); await loadStats();}catch(e){$('trainStatus').textContent=e.message;}}; $('trainStatusBtn').onclick=async()=>{try{const d=await api('/api/admin/train-status'); $('trainStatus').textContent=JSON.stringify(d,null,2);}catch(e){$('trainStatus').textContent=e.message;}}; function zoom(src){$('zoomImg').src=src; $('zoom').style.display='flex';} function closeZoom(){ $('zoom').style.display='none'; $('zoomImg').removeAttribute('src'); } $('zoomClose').onclick=closeZoom; $('zoom').onclick=e=>{if(e.target.id==='zoom')closeZoom();}; document.addEventListener('keydown',e=>{if(e.key==='Escape')closeZoom();}); if(adminKey){showApp();}else{showLogin();}
@@ -577,6 +709,8 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
                         DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING,
                     ),
                 })
+            elif path == '/api/platform-labeling/next':
+                self.handle_get_platform_labeling()
             elif path.startswith('/api/submissions/'):
                 self.handle_get_submission(path)
             elif path == '/api/admin/stats':
@@ -713,13 +847,33 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
                 item['animal'] = animal
                 item['animals'] = {str(k): v for k, v in (row.get('animals') or {}).items() if v} if isinstance(row.get('animals'), dict) else {}
                 item['user_note'] = str(row.get('note') or '')
-                item['status'] = 'queued'
+                item['status'] = 'approved' if batch.get('source') == 'identify_feedback' else 'queued'
                 item['submitted_at'] = now_iso()
-            batch['status'] = 'queued'
+                if batch.get('source') == 'identify_feedback':
+                    item['reviewed_by'] = 'platform_labeler'
+                    item['review_note'] = 'platform feedback labeled'
+                    item['reviewed_at'] = now_iso()
+            batch['status'] = 'approved' if batch.get('source') == 'identify_feedback' else 'queued'
             batch['submitted_at'] = now_iso()
         self.store.save()
-        self.worker.queue_batch(batch_id)
-        self.ok({'batch_id': batch_id, 'status': 'queued'})
+        if batch.get('source') != 'identify_feedback':
+            self.worker.queue_batch(batch_id)
+        self.ok({'batch_id': batch_id, 'status': batch['status']})
+
+    def handle_get_platform_labeling(self) -> None:
+        with self.store.lock:
+            batches = [
+                batch for batch in self.store.state['batches'].values()
+                if batch.get('source') == 'identify_feedback' and batch.get('status') == 'uploaded'
+            ]
+            if not batches:
+                self.ok({'batch_id': None, 'items': []})
+                return
+            batch = min(batches, key=lambda row: row.get('created_at', ''))
+            items = [self.public_item(self.store.state['items'][item_id]) for item_id in batch['item_ids']]
+            data = dict(batch)
+            data['items'] = items
+        self.ok(data)
 
     def handle_get_submission(self, path: str) -> None:
         batch_id = path.split('/')[3]
@@ -743,6 +897,7 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
         status = (query.get('status') or ['needs_admin'])[0]
         with self.store.lock:
             items = list(self.store.state['items'].values())
+        items = [item for item in items if item.get('source') != 'identify_feedback']
         if status != 'all':
             items = [item for item in items if item.get('status') == status]
         items.sort(key=lambda item: item.get('created_at', ''), reverse=True)
