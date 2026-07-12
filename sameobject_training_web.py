@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
@@ -6,6 +7,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -43,6 +45,7 @@ DEFAULT_REJECT_CONFIDENCE = 0.80
 DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING = True
 IDENTIFY_CACHE_TTL_SECONDS = 60
 PLATFORM_LABELING_CLAIM_TTL_SECONDS = 30 * 60
+REWARD_API_KEY_TTL_SECONDS = 2 * 60 * 60
 ANIMALS = ['', '野猪', '熊', '豹子', '蜘蛛', '鹿', '羊', '牛', '狼', '袋鼠', '不确定']
 
 
@@ -175,14 +178,16 @@ class StateStore:
         self.path = path
         self.lock = threading.RLock()
         self.state = load_json(path, {
-            'version': 2,
+            'version': 3,
             'created_at': now_iso(),
             'batches': {},
             'items': {},
             'identifications': {},
+            'issued_api_keys': {},
             'train_jobs': {},
         })
         self.state.setdefault('identifications', {})
+        self.state.setdefault('issued_api_keys', {})
 
     def save(self) -> None:
         with self.lock:
@@ -196,10 +201,65 @@ class StateStore:
         with self.lock:
             counts: dict[str, int] = {}
             for item in self.state['items'].values():
-                if item.get('source') == 'identify_feedback':
-                    continue
                 counts[item['status']] = counts.get(item['status'], 0) + 1
             return counts
+
+    def cleanup_expired_api_keys(self) -> None:
+        now = datetime.now()
+        with self.lock:
+            expired = [
+                key_id for key_id, record in self.state['issued_api_keys'].items()
+                if datetime.fromisoformat(record['expires_at']) <= now
+            ]
+            for key_id in expired:
+                self.state['issued_api_keys'].pop(key_id, None)
+        if expired:
+            self.save()
+
+    def is_issued_api_key_valid(self, token: str) -> bool:
+        self.cleanup_expired_api_keys()
+        digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        with self.lock:
+            return any(
+                secrets.compare_digest(record.get('token_hash', ''), digest)
+                for record in self.state['issued_api_keys'].values()
+            )
+
+    def issue_batch_api_key_reward(self, batch_id: str) -> None:
+        """给通过初筛的整轮标注发放一个两小时有效的识别 Key。"""
+        with self.lock:
+            batch = self.state['batches'].get(batch_id)
+            if not batch or batch.get('api_key_reward'):
+                return
+            token = f"sao_{secrets.token_urlsafe(32)}"
+            key_id = uuid.uuid4().hex[:16]
+            expires_at = (datetime.now() + timedelta(seconds=REWARD_API_KEY_TTL_SECONDS)).replace(microsecond=0).isoformat()
+            self.state['issued_api_keys'][key_id] = {
+                'id': key_id,
+                'token_hash': hashlib.sha256(token.encode('utf-8')).hexdigest(),
+                'batch_id': batch_id,
+                'created_at': now_iso(),
+                'expires_at': expires_at,
+            }
+            batch['api_key_reward'] = {
+                'key_id': key_id,
+                'expires_at': expires_at,
+                'delivery_token': token,
+            }
+        self.save()
+
+    def claim_batch_api_key_reward(self, batch_id: str) -> dict | None:
+        """一次性返回奖励 Key 原文，避免在状态接口重复暴露。"""
+        with self.lock:
+            batch = self.state['batches'].get(batch_id)
+            reward = (batch or {}).get('api_key_reward') or {}
+            token = reward.pop('delivery_token', None)
+            if not token:
+                return None
+            reward['delivered_at'] = now_iso()
+            payload = {'api_key': token, 'expires_at': reward['expires_at']}
+        self.save()
+        return payload
 
     def cleanup_expired_identifications(self) -> None:
         """清理未反馈的临时识别缓存；它们不会进入标注或训练流程。"""
@@ -547,6 +607,15 @@ class ScreeningWorker:
 
         with self.store.lock:
             batch = self.store.state['batches'][batch_id]
+            eligible_for_reward = identifier is not None and all(
+                self.store.state['items'][item_id].get('status') != 'auto_rejected'
+                and (self.store.state['items'][item_id].get('screen') or {}).get('mode') == 'model'
+                for item_id in batch['item_ids']
+            )
+        if eligible_for_reward:
+            self.store.issue_batch_api_key_reward(batch_id)
+        with self.store.lock:
+            batch = self.store.state['batches'][batch_id]
             batch['status'] = 'screened'
             batch['screen_finished_at'] = now_iso()
         self.store.save()
@@ -688,16 +757,16 @@ USER_HTML = r"""<!doctype html>
     main{height:calc(100vh - 56px);display:grid;grid-template-columns:minmax(620px,1fr) 360px;gap:10px;padding:10px;overflow:hidden}.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;min-height:0}.stage{display:flex;flex-direction:column;overflow:hidden}.topline{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line)}
     .viewer{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:auto;background:#05080c;border-radius:0 0 10px 10px}.imageWrap{position:relative;display:inline-block;max-width:100%;max-height:100%}#captcha{display:block;max-width:100%;max-height:calc(100vh - 128px);height:auto;width:auto;user-select:none}
     .box{position:absolute;border:3px solid #2ea043;border-radius:10px;background:rgba(46,160,67,.06);cursor:pointer;min-width:28px;min-height:28px}.box:hover{background:rgba(46,160,67,.12);border-color:#56d364}.box.selected{border-color:#ff4d4f;background:rgba(255,77,79,.2);box-shadow:0 0 14px rgba(255,77,79,.7)}.box.selected:hover{background:rgba(255,77,79,.24);border-color:#ff7b72}.box .num{position:absolute;left:3px;top:2px;background:rgba(0,0,0,.72);border-radius:5px;padding:0 5px;font-weight:800}.box .tag{position:absolute;right:3px;bottom:2px;background:rgba(31,111,235,.9);border-radius:5px;padding:0 5px;font-size:12px}
-    aside{padding:10px;overflow:auto}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}.pair{font-weight:800}.ok{color:#3fb950}.bad{color:#ff7b72}.yellow{color:#f2cc60}.animalGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.animalGrid button.active{background:var(--blue);border-color:#58a6ff}.thumbs{display:flex;gap:6px;overflow:auto;padding:7px 0}.thumb{border:2px solid var(--line);border-radius:8px;background:#0d1117;padding:2px;cursor:pointer;position:relative}.thumb.active{border-color:#58a6ff}.thumb.done:after{content:"";position:absolute;right:3px;top:3px;width:9px;height:9px;border-radius:50%;background:#3fb950}.thumb img{display:block;width:58px;height:36px;object-fit:cover;border-radius:5px}.hint{font-size:13px;color:#c9d1d9;line-height:1.65}.kbd{background:#30363d;border-radius:4px;padding:1px 5px;font-family:Consolas,monospace}.status{white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:8px;min-height:70px;color:var(--muted)}
+    aside{padding:10px;overflow:auto}.activity{border-left:3px solid #2ea043;background:#111b18;padding:10px;margin-bottom:10px}.activityHead{display:flex;align-items:center;justify-content:space-between;gap:8px}.activityBadge{color:#7ee787;font-size:12px;font-weight:700}.activityFlow{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:9px 0}.activityStep{min-width:0;color:#c9d1d9;font-size:12px;line-height:1.35}.activityStep b{display:block;color:#7ee787;font:700 12px Consolas,monospace;margin-bottom:2px}.activityNote{margin:0;color:#8b949e;font-size:12px;line-height:1.5}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}.pair{font-weight:800}.ok{color:#3fb950}.bad{color:#ff7b72}.yellow{color:#f2cc60}.animalGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.animalGrid button.active{background:var(--blue);border-color:#58a6ff}.thumbs{display:flex;gap:6px;overflow:auto;padding:7px 0}.thumb{border:2px solid var(--line);border-radius:8px;background:#0d1117;padding:2px;cursor:pointer;position:relative}.thumb.active{border-color:#58a6ff}.thumb.done:after{content:"";position:absolute;right:3px;top:3px;width:9px;height:9px;border-radius:50%;background:#3fb950}.thumb img{display:block;width:58px;height:36px;object-fit:cover;border-radius:5px}.hint{font-size:13px;color:#c9d1d9;line-height:1.65}.kbd{background:#30363d;border-radius:4px;padding:1px 5px;font-family:Consolas,monospace}.status{white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:8px;min-height:70px;color:var(--muted)}.rewardModal{position:fixed;inset:0;z-index:80;display:none;place-items:center;background:rgba(0,0,0,.72);padding:18px}.rewardModal.show{display:grid}.rewardDialog{width:min(520px,100%);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;box-shadow:0 24px 64px rgba(0,0,0,.45)}.rewardDialog h2{margin:0 0 8px;font-size:18px}.rewardDialog input{width:100%;font-family:Consolas,monospace}.rewardDialog p{color:var(--muted);margin:8px 0}
     @media(max-width:980px){body{overflow:auto}main{height:auto;grid-template-columns:1fr}.viewer{min-height:420px}#captcha{max-height:70vh}}
   </style>
 </head>
 <body>
-<header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="loadPlatformBtn">领取平台待标注</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
-<main><section class="panel stage"><div class="topline"><div><b id="title">等待上传</b> <span id="fileMeta" class="meta"></span></div><div class="pair" id="pairText">未选择</div></div><div class="viewer"><div id="imageWrap" class="imageWrap"><img id="captcha" alt="当前标注图片"></div></div></section><aside class="panel"><div class="row"><b>动物类别</b><span id="animalText" class="yellow">未选择</span></div><div id="animalGrid" class="animalGrid"></div><div class="row"><input id="animalOther" placeholder="自定义类别" style="flex:1;min-width:0"><button id="applyOtherBtn">应用</button></div><div class="row"><button id="clearPairBtn">清空当前</button><button id="refreshBtn" disabled>刷新初筛</button></div><div class="thumbs" id="thumbs"></div><div class="hint"><p><b>快捷键</b>：<span class="kbd">1-8</span> 选答案格，<span class="kbd">A/←</span> 上一张，<span class="kbd">D/→</span> 下一张，<span class="kbd">Enter</span> 下一张，<span class="kbd">Ctrl+Enter</span> 提交整轮。</p><p>每轮最多 10 张；所有图片都选好两个格子并填写类别后才可提交。</p></div><div id="status" class="status">请选择图片上传。</div></aside></main>
+<header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="loadPlatformBtn">领取平台待标注</button><button id="claimRewardBtn">领取奖励</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
+<main><section class="panel stage"><div class="topline"><div><b id="title">等待上传</b> <span id="fileMeta" class="meta"></span></div><div class="pair" id="pairText">未选择</div></div><div class="viewer"><div id="imageWrap" class="imageWrap"><img id="captcha" alt="当前标注图片"></div></div></section><aside class="panel"><section class="activity"><div class="activityHead"><b>标注奖励活动</b><span class="activityBadge">每轮均可参与</span></div><div class="activityFlow"><div class="activityStep"><b>01</b>完成整轮标注</div><div class="activityStep"><b>02</b>通过后台初筛</div><div class="activityStep"><b>03</b>领取 2 小时 Key</div></div><p class="activityNote">整轮未被判为乱填，即可获得临时识别 API Key。</p></section><div class="row"><b>动物类别</b><span id="animalText" class="yellow">未选择</span></div><div id="animalGrid" class="animalGrid"></div><div class="row"><input id="animalOther" placeholder="自定义类别" style="flex:1;min-width:0"><button id="applyOtherBtn">应用</button></div><div class="row"><button id="clearPairBtn">清空当前</button><button id="refreshBtn" disabled>刷新初筛</button></div><div class="thumbs" id="thumbs"></div><div class="hint"><p><b>快捷键</b>：<span class="kbd">1-8</span> 选答案格，<span class="kbd">A/←</span> 上一张，<span class="kbd">D/→</span> 下一张，<span class="kbd">Enter</span> 下一张，<span class="kbd">Ctrl+Enter</span> 提交整轮。</p><p>每轮最多 10 张；所有图片都选好两个格子并填写类别后才可提交。</p></div><div id="status" class="status">请选择图片上传。</div></aside></main><div id="rewardModal" class="rewardModal" role="dialog" aria-modal="true"><div class="rewardDialog"><h2>获得临时识别 API Key</h2><p id="rewardExpiry"></p><input id="rewardKey" readonly aria-label="API Key"><div class="row"><button id="copyRewardBtn" class="primary">复制 Key</button><button id="closeRewardBtn">关闭</button></div></div></div><div id="noticeModal" class="rewardModal" role="dialog" aria-modal="true"><div class="rewardDialog"><h2 id="noticeTitle"></h2><p id="noticeMessage"></p><div class="row"><button id="closeNoticeBtn" class="primary">知道了</button></div></div></div>
 <script>
-const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; const PLATFORM_BATCH_KEY='sameobject_platform_labeling_batch'; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
-function setStatus(t,cls=''){ $('status').className='status '+cls; $('status').textContent=t; } function esc(s){ return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); } async function api(url,opts={}){ const r=await fetch(url,opts); const d=await r.json().catch(()=>({})); if(!r.ok||d.code) throw new Error(d.message||r.statusText); return d.data??d; }
+const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; const PLATFORM_BATCH_KEY='sameobject_platform_labeling_batch', REWARD_BATCH_KEY='sameobject_reward_batch'; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
+function setStatus(t,cls=''){ $('status').className='status '+cls; $('status').textContent=t; } function esc(s){ return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); } async function api(url,opts={}){ const r=await fetch(url,opts); const d=await r.json().catch(()=>({})); if(!r.ok||d.code) throw new Error(d.message||r.statusText); return d.data??d; } function showNotice(title,message){ $('noticeTitle').textContent=title; $('noticeMessage').textContent=message; $('noticeModal').classList.add('show'); } function hideNotice(){ $('noticeModal').classList.remove('show'); } function showApiKeyReward(reward){ localStorage.removeItem(REWARD_BATCH_KEY); hideNotice(); $('rewardKey').value=reward.api_key; $('rewardExpiry').textContent='有效至：'+new Date(reward.expires_at).toLocaleString(); $('rewardModal').classList.add('show'); } async function copyReward(){ try{ await navigator.clipboard.writeText($('rewardKey').value); }catch(e){ $('rewardKey').select(); document.execCommand('copy'); } $('copyRewardBtn').textContent='已复制'; } $('copyRewardBtn').onclick=copyReward; $('closeRewardBtn').onclick=()=>$('rewardModal').classList.remove('show'); $('closeNoticeBtn').onclick=hideNotice; async function pollReward(batchId,attempt=0){ try{ const d=await api('/api/submissions/'+encodeURIComponent(batchId)); if(d.api_key_reward){ showApiKeyReward(d.api_key_reward); return; } if(['queued','screening'].includes(d.status)&&attempt<120){ setTimeout(()=>pollReward(batchId,attempt+1),3000); }else{ localStorage.removeItem(REWARD_BATCH_KEY); showNotice('领取结果',d.status==='screened'?'本轮未获得奖励。':'奖励领取未成功。'); } }catch(e){ localStorage.removeItem(REWARD_BATCH_KEY); showNotice('领取失败','奖励查询失败，请稍后重试。'); } } $('claimRewardBtn').onclick=()=>{ const batchId=localStorage.getItem(REWARD_BATCH_KEY); if(!batchId){showNotice('领取结果','当前浏览器没有待领取的奖励。');return;} showNotice('正在领取奖励','正在核验本轮提交，请稍候。'); pollReward(batchId); };
 function current(){ return batch?.items[idx]; } function ans(id){ if(!answers.has(id)) answers.set(id,{pair:[],animal:''}); return answers.get(id); } function completeItem(it){ const a=answers.get(it.id); return a&&a.pair.length===2&&a.animal; } function complete(){ return batch&&batch.items.every(completeItem); }
 function renderAnimals(){ const grid=$('animalGrid'); grid.innerHTML=''; const a=current()?ans(current().id):{animal:''}; for(const animal of animals.filter(Boolean)){ const b=document.createElement('button'); b.textContent=animal; b.className=a.animal===animal?'active':''; b.onclick=()=>{ if(!current())return; ans(current().id).animal=animal; render(); }; grid.appendChild(b); } }
 function renderThumbs(){ const root=$('thumbs'); root.innerHTML=''; if(!batch)return; batch.items.forEach((it,i)=>{ const d=document.createElement('button'); d.className='thumb '+(i===idx?'active ':'')+(completeItem(it)?'done':''); d.title=it.filename; d.innerHTML=`<img alt="${esc(it.filename)}" src="${it.image_url}">`; d.onclick=()=>{idx=i;render();}; root.appendChild(d); }); }
@@ -708,9 +777,9 @@ $('uploadBtn').onclick=async()=>{ const files=[...$('fileInput').files]; if(file
 function usePlatformBatch(d,msg){ batch=d; idx=0; answers.clear(); localStorage.setItem(PLATFORM_BATCH_KEY,d.batch_id); render(); setStatus(msg,'ok'); } async function restorePlatformBatch(){ const batchId=localStorage.getItem(PLATFORM_BATCH_KEY); if(!batchId)return; try{ const d=await api('/api/submissions/'+encodeURIComponent(batchId)); if(d.source==='identify_feedback'&&d.status==='labeling'){ usePlatformBatch(d,'已恢复未完成的平台标注批次。'); }else{ localStorage.removeItem(PLATFORM_BATCH_KEY); } }catch(e){ localStorage.removeItem(PLATFORM_BATCH_KEY); } }
 $('loadPlatformBtn').onclick=async()=>{ $('loadPlatformBtn').disabled=true; try{ const savedId=localStorage.getItem(PLATFORM_BATCH_KEY); if(savedId){ const saved=await api('/api/submissions/'+encodeURIComponent(savedId)).catch(()=>null); if(saved?.source==='identify_feedback'&&saved.status==='labeling'){ usePlatformBatch(saved,'已恢复未完成的平台标注批次。'); return; } localStorage.removeItem(PLATFORM_BATCH_KEY); } const d=await api('/api/platform-labeling/next'); if(!d.batch_id){setStatus('暂无平台待标注图片。','yellow');return;} usePlatformBatch(d,`已领取 ${d.items.length} 张平台反馈图片，请在 30 分钟内完成标注。`); }catch(e){setStatus(e.message,'bad');}finally{$('loadPlatformBtn').disabled=false;} };
 $('prevBtn').onclick=()=>move(-1); $('nextBtn').onclick=()=>move(1); $('clearPairBtn').onclick=()=>{ const it=current(); if(!it)return; answers.set(it.id,{pair:[],animal:ans(it.id).animal}); render(); }; $('applyOtherBtn').onclick=()=>{ const it=current(), v=$('animalOther').value.trim(); if(it&&v){ ans(it.id).animal=v; render(); }};
-$('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('提交中...'); try{ const d=await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); if(batch.source==='identify_feedback')localStorage.removeItem(PLATFORM_BATCH_KEY); setStatus(d.status==='approved'?'平台反馈已标注，进入待训练数据。':'提交成功，后台初筛中。','ok'); }catch(e){setStatus(e.message,'bad'); render();} };
+$('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('提交中...'); try{ const d=await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); if(batch.source==='identify_feedback')localStorage.removeItem(PLATFORM_BATCH_KEY); setStatus(d.status==='approved'?'平台反馈已标注，进入待训练数据。':'提交成功，后台初筛中。','ok'); if(d.api_key_reward){showApiKeyReward(d.api_key_reward);}else{ localStorage.setItem(REWARD_BATCH_KEY,batch.batch_id); pollReward(batch.batch_id); } }catch(e){setStatus(e.message,'bad'); render();} };
 $('refreshBtn').onclick=async()=>{ if(!batch)return; try{ const d=await api(`/api/submissions/${batch.batch_id}`); setStatus('批次状态：'+d.status+'\n'+d.items.map(x=>`${x.filename}: ${x.status}${x.screen?.reason?' - '+x.screen.reason:''}`).join('\n'),'yellow'); }catch(e){setStatus(e.message,'bad');} };
-window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render(); restorePlatformBatch();
+window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render(); restorePlatformBatch(); const recoveryRewardBatch=new URLSearchParams(location.search).get('reward_batch'); if(recoveryRewardBatch){ localStorage.setItem(REWARD_BATCH_KEY,recoveryRewardBatch); history.replaceState({},'',location.pathname); } const pendingRewardBatch=localStorage.getItem(REWARD_BATCH_KEY); if(pendingRewardBatch)pollReward(pendingRewardBatch);
 </script></body></html>
 """
 
@@ -720,12 +789,12 @@ ADMIN_HTML = r"""<!doctype html>
 #loginView{min-height:100vh;display:grid;place-items:center;padding:18px}.login{width:min(420px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.35)}.login h1{margin:0 0 10px;font-size:20px}.login input{width:100%;margin:10px 0}.login button{width:100%}#appView{display:none}header{position:sticky;top:0;z-index:20;background:#161b22;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;padding:8px 12px}.brand{font-weight:800;font-size:16px}.spacer{flex:1}.topSwitch{display:flex;align-items:center;gap:8px;padding:7px 10px;border:1px solid var(--line);border-radius:999px;background:#0d1117;color:#c9d1d9;white-space:nowrap}.topSwitch input{min-height:auto;width:16px;height:16px;accent-color:#238636}main{padding:10px;display:grid;gap:10px}.stats{display:grid;grid-template-columns:repeat(5,minmax(100px,1fr));gap:8px}.stat,.panel,.item{background:var(--panel);border:1px solid var(--line);border-radius:10px}.stat{padding:9px 11px}.stat b{display:block;font-size:22px}.panel{padding:10px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.list{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}.item{padding:9px}.item img{width:100%;height:178px;object-fit:contain;background:#05080c;border-radius:8px;cursor:zoom-in}.badge{display:inline-block;padding:2px 7px;border-radius:999px;background:#334155}.badge.needs_admin{background:#854d0e}.badge.approved{background:#166534}.badge.rejected,.badge.auto_rejected{background:#991b1b}.badge.screening{background:#1d4ed8}.small{font-size:12px}.item input{width:92px}.item textarea{width:100%;min-height:54px;margin-top:6px;background:#0d1117}.status{white-space:pre-wrap;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:8px;color:var(--muted);max-height:220px;overflow:auto}#zoom{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.86);display:none;align-items:center;justify-content:center;padding:22px}#zoom img{max-width:96vw;max-height:92vh;border-radius:10px;background:#05080c}#zoom button{position:fixed;right:18px;top:14px}@media(max-width:800px){.stats{grid-template-columns:repeat(2,1fr)}.list{grid-template-columns:1fr}header{flex-wrap:wrap}}
 </style></head><body>
 <section id="loginView"><div class="login"><h1>管理员登录</h1><p class="muted">请输入训练 Web 管理员 Key。成功后只保存在当前浏览器会话中。</p><input id="loginKey" type="password" placeholder="TRAINING_WEB_ADMIN_KEY" autofocus><button id="loginBtn" class="primary">进入审核区</button><p id="loginMsg" class="bad"></p><p><a href="/">返回用户提交页</a></p></div></section>
-<section id="appView"><header><span class="brand">管理员审核</span><button id="refreshBtn">刷新</button><label>状态 <select id="statusFilter"><option value="needs_admin">待审核</option><option value="auto_rejected">自动拦截</option><option value="approved">待训练/已通过</option><option value="rejected">已拒绝</option><option value="screening">初筛中</option><option value="all">全部</option></select></label><label class="topSwitch" title="训练时是否包含模型和用户一致后自动通过的样本"><input id="includeAutoApproved" type="checkbox" checked> 训练包含自动通过</label><span class="spacer"></span><button id="logoutBtn">退出</button><a href="/">用户页</a></header><main><section class="stats" id="stats"></section><section class="panel"><div class="row"><label>run-name <input id="runName" value="web_review_parts_v1" style="width:170px"></label><label>feature <select id="featureMode"><option value="parts_v1">parts_v1</option><option value="processed_v2">processed_v2</option></select></label><label>epochs <input id="epochs" type="number" min="1" value="180" style="width:90px"></label><label>val <input id="valRatio" type="number" min="0.05" max="0.9" step="0.05" value="0.2" style="width:80px"></label><button id="trainBtn" class="success">全部审核后训练</button><button id="trainStatusBtn">训练状态</button></div><div id="trainStatus" class="status">尚未查询。</div></section><section class="list" id="list"></section></main></section><div id="zoom"><button id="zoomClose">关闭 Esc</button><img id="zoomImg" alt="放大预览"></div>
+<section id="appView"><header><span class="brand">管理员审核</span><button id="refreshBtn">刷新</button><label>状态 <select id="statusFilter"><option value="needs_admin">待审核</option><option value="uploaded">待用户提交/未提交</option><option value="labeling">用户标注中</option><option value="queued">等待初筛</option><option value="screening">初筛中</option><option value="approved">待训练/已通过</option><option value="auto_rejected">自动拦截</option><option value="rejected">已拒绝</option><option value="all">全部</option></select></label><label class="topSwitch" title="训练时是否包含模型和用户一致后自动通过的样本"><input id="includeAutoApproved" type="checkbox" checked> 训练包含自动通过</label><span class="spacer"></span><button id="logoutBtn">退出</button><a href="/">用户页</a></header><main><section class="stats" id="stats"></section><section class="panel"><div class="row"><label>run-name <input id="runName" value="web_review_parts_v1" style="width:170px"></label><label>feature <select id="featureMode"><option value="parts_v1">parts_v1</option><option value="processed_v2">processed_v2</option></select></label><label>epochs <input id="epochs" type="number" min="1" value="180" style="width:90px"></label><label>val <input id="valRatio" type="number" min="0.05" max="0.9" step="0.05" value="0.2" style="width:80px"></label><button id="trainBtn" class="success">全部审核后训练</button><button id="trainStatusBtn">训练状态</button></div><div id="trainStatus" class="status">尚未查询。</div></section><section class="list" id="list"></section></main></section><div id="zoom"><button id="zoomClose">关闭 Esc</button><img id="zoomImg" alt="放大预览"></div>
 <script>
 const KEY='sameobject_admin_key'; const $=id=>document.getElementById(id); let adminKey=sessionStorage.getItem(KEY)||''; function esc(s){return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));} function headers(){return {'Content-Type':'application/json','X-Admin-Key':adminKey};} async function api(url,opts={}){opts.headers={...(opts.headers||{}),...headers()};const r=await fetch(url,opts);const d=await r.json().catch(()=>({}));if(!r.ok||d.code){if(r.status===401)showLogin('Key 不正确或已失效。');throw new Error(d.message||r.statusText);}return d.data??d;} function showLogin(msg=''){ $('loginView').style.display='grid'; $('appView').style.display='none'; $('loginMsg').textContent=msg; } async function loadConfig(){try{const r=await fetch('/api/config'); const d=await r.json(); if(d.data&&typeof d.data.include_auto_approved_in_training==='boolean') $('includeAutoApproved').checked=d.data.include_auto_approved_in_training;}catch(e){}} async function showApp(){ $('loginView').style.display='none'; $('appView').style.display='block'; await loadConfig(); loadList().catch(e=>showLogin(e.message)); }
 $('loginBtn').onclick=async()=>{adminKey=$('loginKey').value.trim(); if(!adminKey){$('loginMsg').textContent='请输入 Key。';return;} try{await api('/api/admin/stats'); sessionStorage.setItem(KEY,adminKey); showApp();}catch(e){$('loginMsg').textContent=e.message;}}; $('loginKey').addEventListener('keydown',e=>{if(e.key==='Enter')$('loginBtn').click();}); $('logoutBtn').onclick=()=>{sessionStorage.removeItem(KEY);adminKey='';showLogin('已退出。');};
-function badge(s){return `<span class="badge ${esc(s)}">${esc(s)}</span>`;} async function loadStats(){const d=await api('/api/admin/stats'); const labels={needs_admin:'待标注/待人工',screening:'初筛中',auto_rejected:'自动拦截',approved:'待训练/已通过',rejected:'已拒绝'}; const keys=['needs_admin','screening','auto_rejected','approved','rejected']; $('stats').innerHTML=keys.map(k=>`<div class="stat"><span class="muted">${labels[k]}</span><b>${d.counts[k]||0}</b></div>`).join('');} async function loadList(){await loadStats(); const st=$('statusFilter').value; const d=await api('/api/admin/items?status='+encodeURIComponent(st)); $('list').innerHTML=d.items.map(renderItem).join(''); document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>review(b.dataset.id,b.dataset.action)); document.querySelectorAll('[data-zoom]').forEach(img=>img.onclick=()=>zoom(img.src));}
-function renderItem(it){const s=it.screen||{}, pair=(it.pair||[]).join(','); return `<article class="item"><div class="row" style="justify-content:space-between"><b title="${esc(it.filename)}">${esc(it.filename)}</b>${badge(it.status)}</div><img data-zoom src="${it.image_url}" alt="审核图片 ${esc(it.filename)}" loading="lazy"><div class="small muted">提交：pair=[${esc(pair)}] animal=${esc(it.animal||'')}</div><div class="small ${s.ok===false?'bad':'yellow'}">${esc(s.reason||'无初筛信息')} ${s.pred_pair?`预测=[${esc(s.pred_pair.join(','))}] ${esc(s.pred_animal||'')} score=${esc(s.confidence)}`:''}</div><div class="row"><label>pair <input id="pair-${esc(it.id)}" value="${esc(pair)}"></label><label>animal <input id="animal-${esc(it.id)}" value="${esc(it.animal||'')}"></label></div><textarea id="note-${esc(it.id)}" placeholder="备注">${esc(it.review_note||'')}</textarea><div class="row"><button class="success" data-action="approve" data-id="${esc(it.id)}">通过</button><button class="danger" data-action="reject" data-id="${esc(it.id)}">拒绝</button><button class="warnBtn" data-action="needs_admin" data-id="${esc(it.id)}">待审</button></div></article>`;}
+function badge(s){return `<span class="badge ${esc(s)}">${esc(s)}</span>`;} async function loadStats(){const d=await api('/api/admin/stats'); const labels={needs_admin:'待审核',uploaded:'待用户提交',labeling:'用户标注中',queued:'等待初筛',screening:'初筛中',approved:'待训练/已通过',auto_rejected:'自动拦截',rejected:'已拒绝'}; const keys=['needs_admin','uploaded','labeling','queued','screening','approved','auto_rejected','rejected']; $('stats').innerHTML=keys.map(k=>`<div class="stat"><span class="muted">${labels[k]}</span><b>${d.counts[k]||0}</b></div>`).join('');} async function loadList(){await loadStats(); const st=$('statusFilter').value; const d=await api('/api/admin/items?status='+encodeURIComponent(st)); $('list').innerHTML=d.items.map(renderItem).join(''); document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>review(b.dataset.id,b.dataset.action)); document.querySelectorAll('[data-zoom]').forEach(img=>img.onclick=()=>zoom(img.src));}
+function renderItem(it){const s=it.screen||{}, pair=(it.pair||[]).join(','); return `<article class="item"><div class="row" style="justify-content:space-between"><b title="${esc(it.filename)}">${esc(it.filename)}</b>${badge(it.status)}</div><img data-zoom src="${it.image_url}" alt="审核图片 ${esc(it.filename)}" loading="lazy"><div class="small muted">来源：${esc(it.source||'user_upload')} · 状态：${esc(it.status||'')} · 创建：${esc(it.created_at||'')} ${it.submitted_at?'· 提交：'+esc(it.submitted_at):''}</div><div class="small muted">提交：pair=[${esc(pair)}] animal=${esc(it.animal||'')}</div><div class="small ${s.ok===false?'bad':'yellow'}">${esc(s.reason||'无初筛信息')} ${s.pred_pair?`预测=[${esc(s.pred_pair.join(','))}] ${esc(s.pred_animal||'')} score=${esc(s.confidence)}`:''}</div><div class="row"><label>pair <input id="pair-${esc(it.id)}" value="${esc(pair)}"></label><label>animal <input id="animal-${esc(it.id)}" value="${esc(it.animal||'')}"></label></div><textarea id="note-${esc(it.id)}" placeholder="备注">${esc(it.review_note||'')}</textarea><div class="row"><button class="success" data-action="approve" data-id="${esc(it.id)}">通过</button><button class="danger" data-action="reject" data-id="${esc(it.id)}">拒绝</button><button class="warnBtn" data-action="needs_admin" data-id="${esc(it.id)}">待审</button></div></article>`;}
 async function review(id,decision){const pair=document.getElementById('pair-'+id).value.split(',').map(x=>Number(x.trim())).filter(Boolean); const animal=document.getElementById('animal-'+id).value.trim(); const note=document.getElementById('note-'+id).value.trim(); try{await api('/api/admin/items/'+id+'/review',{method:'POST',body:JSON.stringify({decision,pair,animal,note})}); await loadList();}catch(e){alert(e.message);}}
 $('refreshBtn').onclick=loadList; $('statusFilter').onchange=loadList; $('trainBtn').onclick=async()=>{const p={run_name:$('runName').value.trim(),feature_mode:$('featureMode').value,epochs:Number($('epochs').value),val_ratio:Number($('valRatio').value),include_auto_approved:$('includeAutoApproved').checked}; $('trainStatus').textContent='启动中...'; try{const d=await api('/api/admin/train',{method:'POST',body:JSON.stringify(p)}); $('trainStatus').textContent=JSON.stringify(d,null,2); await loadStats();}catch(e){$('trainStatus').textContent=e.message;}}; $('trainStatusBtn').onclick=async()=>{try{const d=await api('/api/admin/train-status'); $('trainStatus').textContent=JSON.stringify(d,null,2);}catch(e){$('trainStatus').textContent=e.message;}}; function zoom(src){$('zoomImg').src=src; $('zoom').style.display='flex';} function closeZoom(){ $('zoom').style.display='none'; $('zoomImg').removeAttribute('src'); } $('zoomClose').onclick=closeZoom; $('zoom').onclick=e=>{if(e.target.id==='zoom')closeZoom();}; document.addEventListener('keydown',e=>{if(e.key==='Escape')closeZoom();}); if(adminKey){showApp();}else{showLogin();}
 </script></body></html>
@@ -949,9 +1018,16 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
             batch['status'] = 'approved' if batch.get('source') == 'identify_feedback' else 'queued'
             batch['submitted_at'] = now_iso()
         self.store.save()
-        if batch.get('source') != 'identify_feedback':
+        api_key_reward = None
+        if batch.get('source') == 'identify_feedback':
+            self.store.issue_batch_api_key_reward(batch_id)
+            api_key_reward = self.store.claim_batch_api_key_reward(batch_id)
+        else:
             self.worker.queue_batch(batch_id)
-        self.ok({'batch_id': batch_id, 'status': batch['status']})
+        response = {'batch_id': batch_id, 'status': batch['status']}
+        if api_key_reward:
+            response['api_key_reward'] = api_key_reward
+        self.ok(response)
 
     def handle_get_platform_labeling(self) -> None:
         batch = self.store.claim_platform_labeling_batch()
@@ -968,6 +1044,7 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
     def handle_get_submission(self, path: str) -> None:
         batch_id = path.split('/')[3]
         self.store.release_expired_platform_claims()
+        api_key_reward = self.store.claim_batch_api_key_reward(batch_id)
         with self.store.lock:
             batch = self.store.state['batches'].get(batch_id)
             if not batch:
@@ -975,12 +1052,22 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
                 return
             items = [self.public_item(self.store.state['items'][item_id]) for item_id in batch['item_ids']]
             data = dict(batch)
+            data.pop('api_key_reward', None)
             data['batch_id'] = batch['id']
             data['items'] = items
+            if api_key_reward:
+                data['api_key_reward'] = api_key_reward
         self.ok(data)
 
     def public_item(self, item: dict) -> dict:
         data = dict(item)
+        with self.store.lock:
+            batch = self.store.state['batches'].get(str(item.get('batch_id') or '')) or {}
+            source_batch = self.store.state['batches'].get(str(item.get('source_batch_id') or '')) or {}
+        if not data.get('source'):
+            data['source'] = batch.get('source') or source_batch.get('source') or 'user_upload'
+        data['batch_status'] = batch.get('status', '')
+        data['batch_id'] = item.get('batch_id', '')
         data['image_url'] = f"/media/item/{item['id']}"
         return data
 
@@ -989,7 +1076,6 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
         status = (query.get('status') or ['needs_admin'])[0]
         with self.store.lock:
             items = list(self.store.state['items'].values())
-        items = [item for item in items if item.get('source') != 'identify_feedback']
         if status != 'all':
             items = [item for item in items if item.get('status') == status]
         items.sort(key=lambda item: item.get('created_at', ''), reverse=True)

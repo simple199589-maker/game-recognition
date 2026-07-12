@@ -23,8 +23,10 @@ Authorization: Bearer <your-api-key>
 鉴权失败返回：
 
 ```json
-{"code":401,"message":"Unauthorized"}
+{"code":401,"message":"API Key 不存在或已经失效。"}
 ```
+
+训练标注页中，手动上传的整轮数据完成后台模型初筛后，若每张均未被判为乱填，会发放一个两小时有效的临时 API Key；平台待标注整轮提交成功后也会立即发放。该 Key 与 `SAMEOBJECT_API_KEY` 一样可用于本接口；Key 原文只在领取弹窗中展示一次。
 
 ## Identify Image
 
@@ -134,7 +136,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8090/api/identify/feedback
 | HTTP | code | Meaning |
 |---|---:|---|
 | 400 | 400 | 请求体、base64 或图片大小不合法。 |
-| 401 | 401 | 缺少或错误的 API Key。 |
+| 401 | 401 | API Key 不存在或已经失效。 |
 | 404 | 404 | 路径不存在。 |
 | 405 | 405 | 方法错误；识别接口必须使用 POST。 |
 | 500 | 500 | 图片无法识别为 8 宫格或推理失败。 |

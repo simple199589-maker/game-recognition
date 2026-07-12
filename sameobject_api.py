@@ -122,7 +122,9 @@ def build_handler(identifier: Identifier, api_key: str, store, training_web_base
                 authorization = self.headers.get('Authorization', '')
                 if authorization.lower().startswith('bearer '):
                     candidate = authorization[7:].strip()
-            return bool(candidate) and hmac.compare_digest(candidate, api_key)
+            return bool(candidate) and (
+                hmac.compare_digest(candidate, api_key) or store.is_issued_api_key_valid(candidate)
+            )
 
         def do_OPTIONS(self) -> None:
             self.send_response(HTTPStatus.NO_CONTENT)
@@ -151,7 +153,7 @@ def build_handler(identifier: Identifier, api_key: str, store, training_web_base
                 self.send_json(HTTPStatus.NOT_FOUND, {'code': 404, 'message': 'Not Found'})
                 return
             if not self.is_authorized():
-                self.send_json(HTTPStatus.UNAUTHORIZED, {'code': 401, 'message': 'Unauthorized'})
+                self.send_json(HTTPStatus.UNAUTHORIZED, {'code': 401, 'message': 'API Key 不存在或已经失效。'})
                 return
 
             try:
