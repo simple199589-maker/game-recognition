@@ -15,7 +15,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,7 +45,9 @@ DEFAULT_REJECT_CONFIDENCE = 0.80
 DEFAULT_INCLUDE_AUTO_APPROVED_IN_TRAINING = True
 IDENTIFY_CACHE_TTL_SECONDS = 60
 PLATFORM_LABELING_CLAIM_TTL_SECONDS = 30 * 60
-REWARD_API_KEY_TTL_SECONDS = 2 * 60 * 60
+REWARD_API_KEY_TTL_SECONDS = 6 * 60 * 60
+NO_TASK_API_KEY_TTL_SECONDS = 30 * 60
+CHINA_TIMEZONE = timezone(timedelta(hours=8), name='CST')
 ANIMALS = ['', '野猪', '熊', '豹子', '蜘蛛', '鹿', '羊', '牛', '狼', '袋鼠', '不确定']
 
 
@@ -72,7 +74,16 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 
 def now_iso() -> str:
-    return datetime.now().replace(microsecond=0).isoformat()
+    """以 UTC 保存时间，避免部署主机时区改变有效期判断。"""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_stored_time(value: str) -> datetime:
+    """读取新 UTC 记录及历史的 UTC+8 无时区记录。"""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=CHINA_TIMEZONE)
+    return parsed
 
 
 def posix_rel(path: Path) -> str:
@@ -205,11 +216,11 @@ class StateStore:
             return counts
 
     def cleanup_expired_api_keys(self) -> None:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         with self.lock:
             expired = [
                 key_id for key_id, record in self.state['issued_api_keys'].items()
-                if datetime.fromisoformat(record['expires_at']) <= now
+                if parse_stored_time(record['expires_at']) <= now
             ]
             for key_id in expired:
                 self.state['issued_api_keys'].pop(key_id, None)
@@ -226,14 +237,14 @@ class StateStore:
             )
 
     def issue_batch_api_key_reward(self, batch_id: str) -> None:
-        """给通过初筛的整轮标注发放一个两小时有效的识别 Key。"""
+        """给通过初筛的整轮标注发放一个六小时有效的识别 Key。"""
         with self.lock:
             batch = self.state['batches'].get(batch_id)
             if not batch or batch.get('api_key_reward'):
                 return
             token = f"sao_{secrets.token_urlsafe(32)}"
             key_id = uuid.uuid4().hex[:16]
-            expires_at = (datetime.now() + timedelta(seconds=REWARD_API_KEY_TTL_SECONDS)).replace(microsecond=0).isoformat()
+            expires_at = (datetime.now(timezone.utc) + timedelta(seconds=REWARD_API_KEY_TTL_SECONDS)).replace(microsecond=0).isoformat()
             self.state['issued_api_keys'][key_id] = {
                 'id': key_id,
                 'token_hash': hashlib.sha256(token.encode('utf-8')).hexdigest(),
@@ -261,6 +272,23 @@ class StateStore:
         self.save()
         return payload
 
+    def issue_no_task_api_key_reward(self) -> dict:
+        """队列为空时发放半小时临时 Key。"""
+        self.cleanup_expired_api_keys()
+        token = f"sao_{secrets.token_urlsafe(32)}"
+        key_id = uuid.uuid4().hex[:16]
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=NO_TASK_API_KEY_TTL_SECONDS)).replace(microsecond=0).isoformat()
+        with self.lock:
+            self.state['issued_api_keys'][key_id] = {
+                'id': key_id,
+                'token_hash': hashlib.sha256(token.encode('utf-8')).hexdigest(),
+                'purpose': 'no_task_reward',
+                'created_at': now_iso(),
+                'expires_at': expires_at,
+            }
+        self.save()
+        return {'api_key': token, 'expires_at': expires_at}
+
     def cleanup_expired_identifications(self) -> None:
         """清理未反馈的临时识别缓存；它们不会进入标注或训练流程。"""
         cutoff = time.time() - IDENTIFY_CACHE_TTL_SECONDS
@@ -270,7 +298,7 @@ class StateStore:
                 if record.get('feedback'):
                     continue
                 try:
-                    created_at = datetime.fromisoformat(record['created_at']).timestamp()
+                    created_at = parse_stored_time(record['created_at']).timestamp()
                 except (KeyError, TypeError, ValueError):
                     created_at = 0
                 if created_at < cutoff:
@@ -286,7 +314,7 @@ class StateStore:
 
     def release_expired_platform_claims(self) -> int:
         """释放超时的领取批次，让图片重新回到平台待标注队列。"""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         released = 0
         with self.lock:
             expired_claims = []
@@ -294,7 +322,7 @@ class StateStore:
                 if batch.get('claim_kind') != 'platform_labeling' or batch.get('status') != 'labeling':
                     continue
                 try:
-                    expires_at = datetime.fromisoformat(batch['claim_expires_at'])
+                    expires_at = parse_stored_time(batch['claim_expires_at'])
                 except (KeyError, TypeError, ValueError):
                     expires_at = now
                 if expires_at <= now:
@@ -346,7 +374,7 @@ class StateStore:
 
             claim_id = f'platform-{uuid.uuid4().hex[:12]}'
             claimed_at = now_iso()
-            expires_at = (datetime.now() + timedelta(seconds=PLATFORM_LABELING_CLAIM_TTL_SECONDS)).replace(microsecond=0).isoformat()
+            expires_at = (datetime.now(timezone.utc) + timedelta(seconds=PLATFORM_LABELING_CLAIM_TTL_SECONDS)).replace(microsecond=0).isoformat()
             for source_batch, item in candidates:
                 source_batch['status'] = 'claimed'
                 source_batch['claimed_at'] = claimed_at
@@ -762,11 +790,11 @@ USER_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-<header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="loadPlatformBtn">领取平台待标注</button><button id="claimRewardBtn">领取奖励</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
-<main><section class="panel stage"><div class="topline"><div><b id="title">等待上传</b> <span id="fileMeta" class="meta"></span></div><div class="pair" id="pairText">未选择</div></div><div class="viewer"><div id="imageWrap" class="imageWrap"><img id="captcha" alt="当前标注图片"></div></div></section><aside class="panel"><section class="activity"><div class="activityHead"><b>标注奖励活动</b><span class="activityBadge">每轮均可参与</span></div><div class="activityFlow"><div class="activityStep"><b>01</b>完成整轮标注</div><div class="activityStep"><b>02</b>通过后台初筛</div><div class="activityStep"><b>03</b>领取 2 小时 Key</div></div><p class="activityNote">整轮未被判为乱填，即可获得临时识别 API Key。</p></section><div class="row"><b>动物类别</b><span id="animalText" class="yellow">未选择</span></div><div id="animalGrid" class="animalGrid"></div><div class="row"><input id="animalOther" placeholder="自定义类别" style="flex:1;min-width:0"><button id="applyOtherBtn">应用</button></div><div class="row"><button id="clearPairBtn">清空当前</button><button id="refreshBtn" disabled>刷新初筛</button></div><div class="thumbs" id="thumbs"></div><div class="hint"><p><b>快捷键</b>：<span class="kbd">1-8</span> 选答案格，<span class="kbd">A/←</span> 上一张，<span class="kbd">D/→</span> 下一张，<span class="kbd">Enter</span> 下一张，<span class="kbd">Ctrl+Enter</span> 提交整轮。</p><p>每轮最多 10 张；所有图片都选好两个格子并填写类别后才可提交。</p></div><div id="status" class="status">请选择图片上传。</div></aside></main><div id="rewardModal" class="rewardModal" role="dialog" aria-modal="true"><div class="rewardDialog"><h2>获得临时识别 API Key</h2><p id="rewardExpiry"></p><input id="rewardKey" readonly aria-label="API Key"><div class="row"><button id="copyRewardBtn" class="primary">复制 Key</button><button id="closeRewardBtn">关闭</button></div></div></div><div id="noticeModal" class="rewardModal" role="dialog" aria-modal="true"><div class="rewardDialog"><h2 id="noticeTitle"></h2><p id="noticeMessage"></p><div class="row"><button id="closeNoticeBtn" class="primary">知道了</button></div></div></div>
+<header><span class="brand">SameObject 训练标注</span><input id="fileInput" type="file" accept="image/*" multiple style="max-width:250px"><button id="uploadBtn" class="primary">上传</button><button id="loadPlatformBtn">领取任务</button><button id="claimRewardBtn">领取奖励</button><button id="guideBtn">规则说明</button><button id="prevBtn">上一张 A</button><button id="nextBtn">下一张 D</button><button id="submitBtn" class="success" disabled>提交整轮 Ctrl+Enter</button><span id="progress" class="meta">未上传</span><span style="flex:1"></span><a href="/admin">管理员</a></header>
+<main><section class="panel stage"><div class="topline"><div><b id="title">等待上传</b> <span id="fileMeta" class="meta"></span></div><div class="pair" id="pairText">未选择</div></div><div class="viewer"><div id="imageWrap" class="imageWrap"><img id="captcha" alt="当前标注图片"></div></div></section><aside class="panel"><section class="activity"><div class="activityHead"><b>标注奖励活动</b><span class="activityBadge">每轮均可参与</span></div><div class="activityFlow"><div class="activityStep"><b>01</b>完成整轮标注</div><div class="activityStep"><b>02</b>通过后台初筛</div><div class="activityStep"><b>03</b>领取 6 小时 Key</div></div><p class="activityNote">整轮未被判为乱填，即可获得临时识别 API Key。</p></section><div class="row"><b>动物类别</b><span id="animalText" class="yellow">未选择</span></div><div id="animalGrid" class="animalGrid"></div><div class="row"><input id="animalOther" placeholder="自定义类别" style="flex:1;min-width:0"><button id="applyOtherBtn">应用</button></div><div class="row"><button id="clearPairBtn">清空当前</button><button id="refreshBtn" disabled>刷新初筛</button></div><div class="thumbs" id="thumbs"></div><div class="hint"><p><b>快捷键</b>：<span class="kbd">1-8</span> 选答案格，<span class="kbd">A/←</span> 上一张，<span class="kbd">D/→</span> 下一张，<span class="kbd">Enter</span> 下一张，<span class="kbd">Ctrl+Enter</span> 提交整轮。</p><p>每轮最多 10 张；所有图片都选好两个格子并填写类别后才可提交。</p></div><div id="status" class="status">请选择图片上传。</div></aside></main><div id="rewardModal" class="rewardModal" role="dialog" aria-modal="true"><div class="rewardDialog"><h2 id="rewardTitle">获得临时识别 API Key</h2><p id="rewardExpiry"></p><input id="rewardKey" readonly aria-label="API Key"><div class="row"><button id="copyRewardBtn" class="primary">复制 Key</button><button id="closeRewardBtn">关闭</button></div></div></div><div id="guideModal" class="rewardModal" role="dialog" aria-modal="true" aria-labelledby="guideTitle"><div class="rewardDialog"><h2 id="guideTitle">任务规则与奖励</h2><p>1. 上传 1-10 张九重妖楼截图，逐张选择两张相同动物所在格子，并填写动物类别。</p><p>2. 完成整轮后提交；系统会进行初筛。页面会自动查询结果，也可点击“领取奖励”继续查询。</p><p>3. 初筛通过后，领取一次性展示的临时识别 API Key。Key 有效期为 6 小时，请立即复制保存。</p><p>平台没有待标注任务时，点击“领取任务”可领取一枚 30 分钟临时识别 API Key。</p><p>奖励有效期统一按中国标准时间（UTC+8）展示和计算。</p><div class="row"><button id="closeGuideBtn" class="primary">开始任务</button></div></div></div><div id="noticeModal" class="rewardModal" role="dialog" aria-modal="true"><div class="rewardDialog"><h2 id="noticeTitle"></h2><p id="noticeMessage"></p><div class="row"><button id="closeNoticeBtn" class="primary">知道了</button></div></div></div>
 <script>
-const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; const PLATFORM_BATCH_KEY='sameobject_platform_labeling_batch', REWARD_BATCH_KEY='sameobject_reward_batch'; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
-function setStatus(t,cls=''){ $('status').className='status '+cls; $('status').textContent=t; } function esc(s){ return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); } async function api(url,opts={}){ const r=await fetch(url,opts); const d=await r.json().catch(()=>({})); if(!r.ok||d.code) throw new Error(d.message||r.statusText); return d.data??d; } function showNotice(title,message){ $('noticeTitle').textContent=title; $('noticeMessage').textContent=message; $('noticeModal').classList.add('show'); } function hideNotice(){ $('noticeModal').classList.remove('show'); } function showApiKeyReward(reward){ localStorage.removeItem(REWARD_BATCH_KEY); hideNotice(); $('rewardKey').value=reward.api_key; $('rewardExpiry').textContent='有效至：'+new Date(reward.expires_at).toLocaleString(); $('rewardModal').classList.add('show'); } async function copyReward(){ try{ await navigator.clipboard.writeText($('rewardKey').value); }catch(e){ $('rewardKey').select(); document.execCommand('copy'); } $('copyRewardBtn').textContent='已复制'; } $('copyRewardBtn').onclick=copyReward; $('closeRewardBtn').onclick=()=>$('rewardModal').classList.remove('show'); $('closeNoticeBtn').onclick=hideNotice; async function pollReward(batchId,attempt=0){ try{ const d=await api('/api/submissions/'+encodeURIComponent(batchId)); if(d.api_key_reward){ showApiKeyReward(d.api_key_reward); return; } if(['queued','screening'].includes(d.status)&&attempt<120){ setTimeout(()=>pollReward(batchId,attempt+1),3000); }else{ localStorage.removeItem(REWARD_BATCH_KEY); showNotice('领取结果',d.status==='screened'?'本轮未获得奖励。':'奖励领取未成功。'); } }catch(e){ localStorage.removeItem(REWARD_BATCH_KEY); showNotice('领取失败','奖励查询失败，请稍后重试。'); } } $('claimRewardBtn').onclick=()=>{ const batchId=localStorage.getItem(REWARD_BATCH_KEY); if(!batchId){showNotice('领取结果','当前浏览器没有待领取的奖励。');return;} showNotice('正在领取奖励','正在核验本轮提交，请稍候。'); pollReward(batchId); };
+const animals = ['', '野猪','熊','豹子','蜘蛛','鹿','羊','牛','狼','袋鼠','不确定']; const PLATFORM_BATCH_KEY='sameobject_platform_labeling_batch', REWARD_BATCH_KEY='sameobject_reward_batch', GUIDE_SEEN_KEY='sameobject_task_guide_seen'; let batch=null, idx=0; const answers=new Map(); const $=id=>document.getElementById(id);
+function setStatus(t,cls=''){ $('status').className='status '+cls; $('status').textContent=t; } function esc(s){ return String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); } function chinaTime(value){ const date=new Date(value); return Number.isNaN(date.getTime())?'时间未知':new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(date)+'（中国标准时间 UTC+8）'; } async function api(url,opts={}){ const r=await fetch(url,opts); const d=await r.json().catch(()=>({})); if(!r.ok||d.code) throw new Error(d.message||r.statusText); return d.data??d; } function showNotice(title,message){ $('noticeTitle').textContent=title; $('noticeMessage').textContent=message; $('noticeModal').classList.add('show'); } function hideNotice(){ $('noticeModal').classList.remove('show'); } function showApiKeyReward(reward,title='获得临时识别 API Key'){ localStorage.removeItem(REWARD_BATCH_KEY); hideNotice(); $('rewardTitle').textContent=title; $('rewardKey').value=reward.api_key; $('rewardExpiry').textContent='有效至：'+chinaTime(reward.expires_at); $('rewardModal').classList.add('show'); } function showGuide(){ $('guideModal').classList.add('show'); } function hideGuide(){ $('guideModal').classList.remove('show'); localStorage.setItem(GUIDE_SEEN_KEY,'1'); } async function copyReward(){ try{ await navigator.clipboard.writeText($('rewardKey').value); }catch(e){ $('rewardKey').select(); document.execCommand('copy'); } $('copyRewardBtn').textContent='已复制'; } $('copyRewardBtn').onclick=copyReward; $('closeRewardBtn').onclick=()=>$('rewardModal').classList.remove('show'); $('guideBtn').onclick=showGuide; $('closeGuideBtn').onclick=hideGuide; $('closeNoticeBtn').onclick=hideNotice; async function pollReward(batchId,attempt=0){ try{ const d=await api('/api/submissions/'+encodeURIComponent(batchId)); if(d.api_key_reward){ showApiKeyReward(d.api_key_reward); return; } if(['queued','screening'].includes(d.status)&&attempt<120){ setTimeout(()=>pollReward(batchId,attempt+1),3000); }else{ localStorage.removeItem(REWARD_BATCH_KEY); showNotice('领取结果',d.status==='screened'?'本轮未获得奖励。':'奖励领取未成功。'); } }catch(e){ localStorage.removeItem(REWARD_BATCH_KEY); showNotice('领取失败','奖励查询失败，请稍后重试。'); } } $('claimRewardBtn').onclick=()=>{ const batchId=localStorage.getItem(REWARD_BATCH_KEY); if(!batchId){showNotice('领取结果','当前浏览器没有待领取的奖励。');return;} showNotice('正在领取奖励','正在核验本轮提交，请稍候。'); pollReward(batchId); };
 function current(){ return batch?.items[idx]; } function ans(id){ if(!answers.has(id)) answers.set(id,{pair:[],animal:''}); return answers.get(id); } function completeItem(it){ const a=answers.get(it.id); return a&&a.pair.length===2&&a.animal; } function complete(){ return batch&&batch.items.every(completeItem); }
 function renderAnimals(){ const grid=$('animalGrid'); grid.innerHTML=''; const a=current()?ans(current().id):{animal:''}; for(const animal of animals.filter(Boolean)){ const b=document.createElement('button'); b.textContent=animal; b.className=a.animal===animal?'active':''; b.onclick=()=>{ if(!current())return; ans(current().id).animal=animal; render(); }; grid.appendChild(b); } }
 function renderThumbs(){ const root=$('thumbs'); root.innerHTML=''; if(!batch)return; batch.items.forEach((it,i)=>{ const d=document.createElement('button'); d.className='thumb '+(i===idx?'active ':'')+(completeItem(it)?'done':''); d.title=it.filename; d.innerHTML=`<img alt="${esc(it.filename)}" src="${it.image_url}">`; d.onclick=()=>{idx=i;render();}; root.appendChild(d); }); }
@@ -775,11 +803,11 @@ function clearBoxes(){ document.querySelectorAll('.box').forEach(x=>x.remove());
 function toggle(n){ const it=current(); if(!it)return; const a=ans(it.id); if(a.pair.includes(n)) a.pair=a.pair.filter(x=>x!==n); else { if(a.pair.length>=2)a.pair.shift(); a.pair.push(n); a.pair.sort((x,y)=>x-y); } render(); } function move(d){ if(!batch)return; idx=(idx+d+batch.items.length)%batch.items.length; render(); }
 $('uploadBtn').onclick=async()=>{ const files=[...$('fileInput').files]; if(files.length<1||files.length>10){setStatus('请选择 1-10 张图片。','bad');return;} const fd=new FormData(); files.forEach(f=>fd.append('images',f)); $('uploadBtn').disabled=true; setStatus('上传并切格中...'); try{ batch=await api('/api/uploads',{method:'POST',body:fd}); idx=0; answers.clear(); render(); setStatus('上传完成，按 1-8 勾选答案。','ok'); }catch(e){setStatus(e.message,'bad');}finally{$('uploadBtn').disabled=false;} };
 function usePlatformBatch(d,msg){ batch=d; idx=0; answers.clear(); localStorage.setItem(PLATFORM_BATCH_KEY,d.batch_id); render(); setStatus(msg,'ok'); } async function restorePlatformBatch(){ const batchId=localStorage.getItem(PLATFORM_BATCH_KEY); if(!batchId)return; try{ const d=await api('/api/submissions/'+encodeURIComponent(batchId)); if(d.source==='identify_feedback'&&d.status==='labeling'){ usePlatformBatch(d,'已恢复未完成的平台标注批次。'); }else{ localStorage.removeItem(PLATFORM_BATCH_KEY); } }catch(e){ localStorage.removeItem(PLATFORM_BATCH_KEY); } }
-$('loadPlatformBtn').onclick=async()=>{ $('loadPlatformBtn').disabled=true; try{ const savedId=localStorage.getItem(PLATFORM_BATCH_KEY); if(savedId){ const saved=await api('/api/submissions/'+encodeURIComponent(savedId)).catch(()=>null); if(saved?.source==='identify_feedback'&&saved.status==='labeling'){ usePlatformBatch(saved,'已恢复未完成的平台标注批次。'); return; } localStorage.removeItem(PLATFORM_BATCH_KEY); } const d=await api('/api/platform-labeling/next'); if(!d.batch_id){setStatus('暂无平台待标注图片。','yellow');return;} usePlatformBatch(d,`已领取 ${d.items.length} 张平台反馈图片，请在 30 分钟内完成标注。`); }catch(e){setStatus(e.message,'bad');}finally{$('loadPlatformBtn').disabled=false;} };
+$('loadPlatformBtn').onclick=async()=>{ $('loadPlatformBtn').disabled=true; try{ const savedId=localStorage.getItem(PLATFORM_BATCH_KEY); if(savedId){ const saved=await api('/api/submissions/'+encodeURIComponent(savedId)).catch(()=>null); if(saved?.source==='identify_feedback'&&saved.status==='labeling'){ usePlatformBatch(saved,'已恢复未完成的平台标注批次。'); return; } localStorage.removeItem(PLATFORM_BATCH_KEY); } const d=await api('/api/platform-labeling/next'); if(!d.batch_id){setStatus('暂时无领取任务，感谢给予训练做出贡献，特下发测试 Key。','yellow'); showApiKeyReward(d.no_task_api_key_reward,'暂时无领取任务，感谢给予训练做出贡献特下发测试 Key'); return;} usePlatformBatch(d,`已领取 ${d.items.length} 张任务，请在 30 分钟内完成标注。`); }catch(e){setStatus(e.message,'bad');}finally{$('loadPlatformBtn').disabled=false;} };
 $('prevBtn').onclick=()=>move(-1); $('nextBtn').onclick=()=>move(1); $('clearPairBtn').onclick=()=>{ const it=current(); if(!it)return; answers.set(it.id,{pair:[],animal:ans(it.id).animal}); render(); }; $('applyOtherBtn').onclick=()=>{ const it=current(), v=$('animalOther').value.trim(); if(it&&v){ ans(it.id).animal=v; render(); }};
 $('submitBtn').onclick=async()=>{ if(!complete())return; const payload={answers:batch.items.map(it=>({item_id:it.id,pair:ans(it.id).pair,animal:ans(it.id).animal}))}; $('submitBtn').disabled=true; setStatus('提交中...'); try{ const d=await api(`/api/submissions/${batch.batch_id}/submit`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); if(batch.source==='identify_feedback')localStorage.removeItem(PLATFORM_BATCH_KEY); setStatus(d.status==='approved'?'平台反馈已标注，进入待训练数据。':'提交成功，后台初筛中。','ok'); if(d.api_key_reward){showApiKeyReward(d.api_key_reward);}else{ localStorage.setItem(REWARD_BATCH_KEY,batch.batch_id); pollReward(batch.batch_id); } }catch(e){setStatus(e.message,'bad'); render();} };
 $('refreshBtn').onclick=async()=>{ if(!batch)return; try{ const d=await api(`/api/submissions/${batch.batch_id}`); setStatus('批次状态：'+d.status+'\n'+d.items.map(x=>`${x.filename}: ${x.status}${x.screen?.reason?' - '+x.screen.reason:''}`).join('\n'),'yellow'); }catch(e){setStatus(e.message,'bad');} };
-window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render(); restorePlatformBatch(); const recoveryRewardBatch=new URLSearchParams(location.search).get('reward_batch'); if(recoveryRewardBatch){ localStorage.setItem(REWARD_BATCH_KEY,recoveryRewardBatch); history.replaceState({},'',location.pathname); } const pendingRewardBatch=localStorage.getItem(REWARD_BATCH_KEY); if(pendingRewardBatch)pollReward(pendingRewardBatch);
+window.addEventListener('resize',drawBoxes); document.addEventListener('keydown',e=>{ if(e.key==='Escape'){hideGuide();return;} if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return; if(e.key>='1'&&e.key<='8')toggle(Number(e.key)); else if(e.key==='ArrowLeft'||e.key.toLowerCase()==='a')move(-1); else if(e.key==='ArrowRight'||e.key.toLowerCase()==='d')move(1); else if(e.key==='Enter'&&e.ctrlKey){e.preventDefault();$('submitBtn').click();} else if(e.key==='Enter'){e.preventDefault();move(1);} }); render(); restorePlatformBatch(); if(!localStorage.getItem(GUIDE_SEEN_KEY))showGuide(); const recoveryRewardBatch=new URLSearchParams(location.search).get('reward_batch'); if(recoveryRewardBatch){ localStorage.setItem(REWARD_BATCH_KEY,recoveryRewardBatch); history.replaceState({},'',location.pathname); } const pendingRewardBatch=localStorage.getItem(REWARD_BATCH_KEY); if(pendingRewardBatch)pollReward(pendingRewardBatch);
 </script></body></html>
 """
 
@@ -1032,7 +1060,11 @@ class TrainingWebHandler(BaseHTTPRequestHandler):
     def handle_get_platform_labeling(self) -> None:
         batch = self.store.claim_platform_labeling_batch()
         if not batch:
-            self.ok({'batch_id': None, 'items': []})
+            self.ok({
+                'batch_id': None,
+                'items': [],
+                'no_task_api_key_reward': self.store.issue_no_task_api_key_reward(),
+            })
             return
         with self.store.lock:
             items = [self.public_item(self.store.state['items'][item_id]) for item_id in batch['item_ids']]
