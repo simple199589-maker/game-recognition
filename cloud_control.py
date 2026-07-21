@@ -17,7 +17,8 @@ from typing import Any
 
 PROTOCOL_VERSION = 1
 VALID_ROLES = frozenset({"master", "slave"})
-VALID_ACTIONS = frozenset({"accept", "complete", "path", "claim_activity"})
+# 经典任务类 action 仍要求非 0 task_id；其余 action（如 map_fly）透传，不维护白名单
+TASK_ID_REQUIRED_ACTIONS = frozenset({"accept", "complete", "path"})
 
 # Tunables (env-overridable via configure())
 DEFAULT_SESSION_TTL_S = 90.0
@@ -255,13 +256,14 @@ class CloudControlHub:
             return {"ok": False, "code": 400, "message": "event 必须是对象"}
 
         action = str(event.get("action") or "").strip().lower()
-        if action not in VALID_ACTIONS:
-            return {"ok": False, "code": 400, "message": f"不支持的 action: {action or '-'}"}
+        if not action:
+            return {"ok": False, "code": 400, "message": "action 不能为空"}
         try:
             task_id = int(event.get("task_id") or 0) & 0xFFFFFFFF
         except (TypeError, ValueError):
             task_id = 0
-        if action != "claim_activity" and not task_id:
+        # 仅对历史任务类 action 校验 task_id；其他 action 原样透传字段
+        if action in TASK_ID_REQUIRED_ACTIONS and not task_id:
             return {"ok": False, "code": 400, "message": "task_id 无效"}
 
         rkey = room_key(api_key, name)
@@ -301,7 +303,7 @@ class CloudControlHub:
 
             mid = str(msg_id or event.get("msg_id") or "").strip()
             if not mid:
-                mid = f"{sess.client_id}-{action}-{task_id}-{int(now * 1000)}"
+                mid = f"{sess.client_id}-{action}-{task_id}-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
             # dedupe
             room.recent_msg_ids = {
                 k: ts for k, ts in room.recent_msg_ids.items() if now - ts <= self.event_ttl_s

@@ -382,7 +382,7 @@ Invoke-RestMethod `
 | POST | `/api/cloud-control/publish` | **仅主控** 广播任务事件 |
 | GET  | `/api/cloud-control/poll` | **仅副控** 长轮询收事件 |
 
-`publish.event.action` 支持：`accept` / `complete` / `path` / `claim_activity`。
+`publish.event.action`：**不维护白名单**，任意非空 action 透传广播（常见如 `accept` / `complete` / `path` / `claim_activity` / `map_fly` 等）。服务端只做统一组装（规范化 `action`/`task_id`、补 `msg_id`/`origin`/`ts`/`source_pid`），其余 event 字段原样转发；返回格式不变。经典任务类 `accept`/`complete`/`path` 仍要求非 0 `task_id`。
 
 详细字段与客户端约定见 `game-get` 仓库 `docs/CLOUD_CONTROL.md`（协议一致）。
 

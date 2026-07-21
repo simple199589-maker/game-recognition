@@ -170,6 +170,66 @@ class HubUnitTests(unittest.TestCase):
         self.assertEqual(polled["events"][0]["event"]["action"], "claim_activity")
         self.assertEqual(polled["events"][0]["event"]["points"], 35)
 
+    def test_map_fly_and_unknown_action_passthrough(self) -> None:
+        """任意非空 action 透传：不维护白名单，event 字段原样到达副控。"""
+        hub = self.hub
+        m = hub.join(api_key="k1", master_name="房", role="master", client_id="m1", pid=11)
+        s = hub.join(api_key="k1", master_name="房", role="slave", client_id="s1", pid=22)
+        for name in ("fuzhou", "shimen", "death"):
+            pub = hub.publish(
+                api_key="k1",
+                master_name="房",
+                session_id=m["session_id"],
+                client_id="m1",
+                event={"action": "map_fly", "task_id": 0, "name": name, "extra": {"x": 1}},
+            )
+            self.assertTrue(pub["ok"], pub)
+            polled = hub.poll(
+                api_key="k1",
+                master_name="房",
+                session_id=s["session_id"],
+                client_id="s1",
+                wait_s=1,
+            )
+            self.assertEqual(len(polled["events"]), 1, polled)
+            ev = polled["events"][0]["event"]
+            self.assertEqual(ev["action"], "map_fly")
+            self.assertEqual(ev["name"], name)
+            self.assertEqual(ev["extra"], {"x": 1})
+            self.assertEqual(ev["origin"], "cloud")
+            self.assertEqual(ev["task_id"], 0)
+
+        # 任意新 action 同样透传
+        pub2 = hub.publish(
+            api_key="k1",
+            master_name="房",
+            session_id=m["session_id"],
+            client_id="m1",
+            event={"action": "custom_sync", "foo": "bar", "task_id": 42},
+        )
+        self.assertTrue(pub2["ok"], pub2)
+        polled2 = hub.poll(
+            api_key="k1",
+            master_name="房",
+            session_id=s["session_id"],
+            client_id="s1",
+            wait_s=1,
+        )
+        self.assertEqual(polled2["events"][0]["event"]["action"], "custom_sync")
+        self.assertEqual(polled2["events"][0]["event"]["foo"], "bar")
+        self.assertEqual(polled2["events"][0]["event"]["task_id"], 42)
+
+        # 空 action 仍拒绝
+        bad = hub.publish(
+            api_key="k1",
+            master_name="房",
+            session_id=m["session_id"],
+            client_id="m1",
+            event={"action": "", "task_id": 1},
+        )
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad.get("code"), 400)
+
     def test_normalize_master_name(self) -> None:
         self.assertEqual(normalize_master_name("  a  b  "), "a b")
 
