@@ -19,6 +19,7 @@ RUN pip install --upgrade pip \
 RUN python -c "from torchvision.models import ResNet18_Weights; ResNet18_Weights.DEFAULT.get_state_dict(progress=True)"
 
 COPY sameobject_api.py /app/sameobject_api.py
+COPY cloud_control.py /app/cloud_control.py
 COPY sameobject_training_web.py /app/sameobject_training_web.py
 COPY tools/predict_sameobject_ensemble.py /app/tools/predict_sameobject_ensemble.py
 COPY tools/train_sameobject_animal_classifier.py /app/tools/train_sameobject_animal_classifier.py
