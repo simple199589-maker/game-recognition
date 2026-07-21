@@ -1,0 +1,8 @@
+listening on http://127.0.0.1:8090
+cloud-control: /api/cloud-control/{join,leave,heartbeat,publish,poll} (X-API-Key, room=master_name)
+training web mounted on same port: /, /admin, /keys
+auth: identify uses SAMEOBJECT_API_KEY or issued keys; /api/license/* uses X-API-Key=login card (or master SAMEOBJECT_API_KEY); /admin,/keys use TRAINING_WEB_ADMIN_KEY; LICENSE_API_SECRET optional HMAC
+127.0.0.1 - "GET /healthz HTTP/1.1" 200 -
+127.0.0.1 - "GET /healthz HTTP/1.1" 200 -
+127.0.0.1 - "POST /api/license/verify HTTP/1.1" 200 -
+127.0.0.1 - "POST /api/license/verify HTTP/1.1" 200 -

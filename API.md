@@ -26,7 +26,7 @@ Authorization: Bearer <your-api-key>
 {"code":401,"message":"API Key 不存在或已经失效。"}
 ```
 
-训练标注页中，手动上传的整轮数据完成后台模型初筛后，若每张均未被判为乱填，会发放一个二十四小时有效的临时 API Key；平台待标注整轮提交成功后也会立即发放。该 Key 与 `SAMEOBJECT_API_KEY` 一样可用于本接口；Key 原文只在领取弹窗中展示一次。服务端以 UTC 保存和校验有效期，用户页面固定按中国标准时间（UTC+8）展示截止时间。
+训练标注页中，手动上传的整轮数据完成后台模型初筛后，若每张均未被判为乱填，会发放一个二十四小时有效的临时 API Key；平台待标注整轮提交成功后也会立即发放。该 Key 与 `SAMEOBJECT_API_KEY` 一样可用于本接口；Key 原文只在领取弹窗中展示一次。服务端以 UTC 保存和校验有效期，页面按东八区展示截止时间。
 
 管理员可在 `/admin` 的“Key 有效期”区域修改“无任务默认”和“答题奖励”的有效期，范围为 0.25 至 720 小时（30 天）。保存后持久化到训练 Web 状态文件，并立即影响之后新发放的 Key；已发放的 Key 有效期不变。
 
@@ -182,13 +182,107 @@ python sameobject_api.py --host 127.0.0.1 --port 8090
 
 - 用户提交页：`http://127.0.0.1:8090/`
 - 管理员审核页：`http://127.0.0.1:8090/admin`
+- 卡密管理页：`http://127.0.0.1:8090/keys`
 - 识别接口：`POST http://127.0.0.1:8090/api/identify/image`
 
-鉴权仍然分开：
+鉴权分开：
 
-- `POST /api/identify/image` 使用 `SAMEOBJECT_API_KEY`，通过 `X-API-Key` 或 `Authorization: Bearer ...` 传递。
-- `/admin` 页面中的 `/api/admin/*` 接口使用 `TRAINING_WEB_ADMIN_KEY`，通过 `X-Admin-Key` 传递。
-- 普通用户上传/提交页面不使用识别 API Key，也不能访问管理员接口。
+- `POST /api/identify/image` 使用 `SAMEOBJECT_API_KEY` 或后台发放识别 Key。
+- `POST /api/license/*` 使用 `X-API-Key: <登录卡密>`（用户卡或通用 `SAMEOBJECT_API_KEY`）。
+- `/admin`、`/keys` 及 `/api/admin/*` 使用 `TRAINING_WEB_ADMIN_KEY`，通过 `X-Admin-Key` 传递。
+- 普通用户上传/提交页面不需要业务 API Key，也不能访问管理员接口。
+- `LICENSE_API_SECRET` 仅为可选 HMAC 签名密钥，**不是** API Key。
+
+
+## License Keys（登录卡密）
+
+> 生产客户端对接请优先阅读：[LICENSE_INTEGRATION.md](./LICENSE_INTEGRATION.md)（用户登录卡密专题）。
+
+用于外部软件登录鉴权。管理员在 `/keys` 页面发卡；客户端调用公开校验接口，首次验证绑定机器码，之后仅同机器可通过。 卡密接口的 `X-API-Key` 即登录卡密；环境变量 `SAMEOBJECT_API_KEY` 为不入库通用卡（不过期、不绑机，`master_key: true`）。识别接口仍用 `SAMEOBJECT_API_KEY` 或发放的识别 Key。
+
+### 校验卡密
+
+`POST /api/license/verify`
+
+### 解绑机器码
+
+`POST /api/license/unbind`
+
+请求：`{"card_key":"...","machine_code":"..."}`（`machine_code` 可选，传则必须匹配）。
+同一张卡密每个**北京自然日**最多解绑 1 次；超限返回 HTTP 429。
+
+管理端修改（需 `X-Admin-Key`）：`POST /api/admin/license-keys/{id}/update`，可改除卡密明文外的字段。
+
+**必须** `X-API-Key: <登录卡密>`（普通用户卡或环境变量通用 Key `SAMEOBJECT_API_KEY`）。  
+body 含 `machine_code`（可选再放 `card_key` 且须与头一致），整 body 参与可选 HMAC。
+
+```json
+{
+  "card_key": "ABCD-EFGH-IJKL-MNOP",
+  "machine_code": "PC-UNIQUE-ID"
+}
+```
+
+成功：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "ok": true,
+    "status": "active",
+    "expires_at": "2026-08-11T12:00:00+00:00",
+    "machine_bound": true,
+    "machine_code_masked": "PC****ID"
+  }
+}
+```
+
+失败示例：
+
+| HTTP | message |
+|---|---|
+| 400 | card_key / machine_code 为空 |
+| 401 | 卡密不存在 |
+| 403 | 卡密已作废 / 已过期 / 机器码不匹配 |
+
+### 管理端（需 `X-Admin-Key`）
+
+- 页面：`GET /keys`
+- `GET /api/admin/license-keys?status=all&page=1&page_size=20&q=关键词`
+  - `status`：`all/unused/active/expired`（页面展示为：全部/未使用/已激活/已过期）
+  - `q`：搜索卡密、机器码、备注、ID
+- `POST /api/admin/license-keys` body: `{"count":1,"expires_at":"2099-12-31T23:59","note":"","no_machine_limit":false}`
+  - `expires_at` 为到期时刻（无时区按东八区理解）；兼容旧字段 `days`
+  - `no_machine_limit`：可选，默认 `false`；`true` 时不限制机器码绑定
+- `POST /api/admin/license-keys/{id}/update`：修改除卡密明文外字段（status/machine_code/expires_at/verify_count/note/no_machine_limit 等）
+- `POST /api/admin/license-keys/{id}/void`：**硬删除**该登录卡密
+
+### 识别 API Key 管理（需 `X-Admin-Key`）
+
+- `GET /api/admin/issued-api-keys?page=1&page_size=20&status=all&q=关键词`
+- `POST /api/admin/issued-api-keys` body: `{"ttl_hours":24,"note":""}`
+  - 后台新增与奖励发放的 Key 均会保存明文，并在列表“卡密”列展示；更早仅存哈希的历史记录显示“明文未保留”
+- `POST /api/admin/issued-api-keys/{id}/void`：**硬删除**；删除后不可再用于 `POST /api/identify/image`
+
+### 管理素材分页
+
+`GET /api/admin/items?status=ready&page=1&page_size=20`
+
+响应包含 `items/page/page_size/total/total_pages`。`status` 支持 `review/in_progress/ready/trained/rejected/all`。
+
+训练启动并导出后，被纳入训练的样本状态变为 `trained`（已训练），不再出现在「待训练」。
+
+### 数据存储
+
+训练 Web 状态默认使用 SQLite：`training_web_data/state.db`（WAL 模式）。
+若存在旧版 `training_web_data/state.json`，启动时会自动迁移并备份为 `state.json.migrated-*`。
+识别 API Key / 登录卡密校验走索引查询，避免高频整文件读写。
+
+
+合并后地址补充：
+
+- 卡密管理页：`http://127.0.0.1:8090/keys`
 
 ## Docker
 
@@ -259,3 +353,36 @@ Invoke-RestMethod `
   -Headers @{ "X-API-Key" = $key } `
   -Body $body
 ```
+
+## Cloud Control（群控云同步）
+
+路径前缀：`/api/cloud-control`
+
+双重鉴权：
+
+1. **用户身份**：请求头 `X-API-Key`（或 `Authorization: Bearer`），支持 `SAMEOBJECT_API_KEY` 与平台发放的临时 Key（同打码接口）。
+2. **请求签名**（与 `/api/license/*` 相同）：
+   - 头：`X-Timestamp` / `X-Nonce` / `X-Signature`
+   - 密钥：`LICENSE_API_SECRET`
+   - `string_to_sign = METHOD\nPATH\ntimestamp\nnonce\nsha256_hex(raw_body)`
+   - `signature = HMAC_SHA256(secret, string_to_sign)` 小写 hex
+   - POST：`PATH` 为固定路径（如 `/api/cloud-control/join`），body 为原始 JSON 字节
+   - GET poll：`PATH` 含 query（如 `/api/cloud-control/poll?master_name=...`），body 为空
+   - 时间窗 / nonce 防重放参数同卡密接口（`LICENSE_SIGN_SKEW_SECONDS`、`LICENSE_NONCE_TTL_SECONDS`）
+   - 开发可设 `LICENSE_SIGN_OPTIONAL=1` 跳过签名（生产务必关闭）
+
+房间隔离：`sha256(api_key)[:16] + ":" + normalize(master_name)`  
+同一用户密钥 + 同一主控名称才互通；不同 Key 即使主控名称相同也互不可见。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/cloud-control/join` | 主控/副控入房，返回 `session_id` / `cursor` |
+| POST | `/api/cloud-control/leave` | 离房 |
+| POST | `/api/cloud-control/heartbeat` | 保活（建议 ≤20s） |
+| POST | `/api/cloud-control/publish` | **仅主控** 广播任务事件 |
+| GET  | `/api/cloud-control/poll` | **仅副控** 长轮询收事件 |
+
+`publish.event.action` 支持：`accept` / `complete` / `path` / `claim_activity`。
+
+详细字段与客户端约定见 `game-get` 仓库 `docs/CLOUD_CONTROL.md`（协议一致）。
+
